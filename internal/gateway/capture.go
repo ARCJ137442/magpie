@@ -68,6 +68,10 @@ func (w *captureResponseWriter) Write(p []byte) (int, error) {
 	return w.ResponseWriter.Write(p)
 }
 
+// Unwrap is for http.ResponseController, and for helpers that need to reach
+// request-scoped response state through capture middleware.
+func (w *captureResponseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
 // spool keeps a body whole for the request archive, beyond the first 256
 // KiB Recent calls holds: in a temporary file, not in memory, up to limit
 // bytes; past that only its size is counted. A negative limit keeps every

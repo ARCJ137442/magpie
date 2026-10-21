@@ -1519,8 +1519,8 @@ func codexUnreached(model string, err error) string {
 }
 
 // codexTransportInterrupted distinguishes a lost or timed-out network path
-// from local request and TLS configuration errors. Only the former should be
-// allowed to look like a native connection failure to Codex.
+// from local request and TLS configuration errors. Only the former is relayed
+// as a transport failure instead of a synthetic HTTP response.
 func codexTransportInterrupted(err error) bool {
 	if err == nil {
 		return false

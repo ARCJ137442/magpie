@@ -6,6 +6,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
 	"strings"
 	"testing"
 
@@ -40,6 +42,9 @@ func TestCodexTransportInterrupted(t *testing.T) {
 	}{
 		{name: "EOF", err: io.EOF, want: true},
 		{name: "unexpected EOF", err: io.ErrUnexpectedEOF, want: true},
+		{name: "timeout", err: os.ErrDeadlineExceeded, want: true},
+		{name: "wrapped connection timeout", err: &url.Error{Op: "Post", Err: &net.OpError{Op: "dial", Net: "tcp", Err: os.ErrDeadlineExceeded}}, want: true},
+		{name: "wrapped request timeout", err: &url.Error{Op: "Post", Err: os.ErrDeadlineExceeded}, want: true},
 		{name: "network operation", err: &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection reset")}, want: true},
 		{name: "temporary DNS", err: &net.DNSError{IsTemporary: true}, want: true},
 		{name: "permanent DNS", err: &net.DNSError{Err: "no such host"}},

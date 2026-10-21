@@ -19,6 +19,24 @@ import (
 	"github.com/yetone/magpie/internal/testenv"
 )
 
+func TestAsyncGatewayResponseDoesNotFlushAbortedResponse(t *testing.T) {
+	gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w, done := gatewayResponse(w, r, provider.Responses, []byte(`{"stream":true}`), nil)
+		defer done()
+		recordResponseStatus(w, http.StatusBadGateway)
+		panic(http.ErrAbortHandler)
+	}))
+	t.Cleanup(gw.Close)
+	resp, err := gw.Client().Post(gw.URL, "application/json", strings.NewReader(`{"stream":true}`))
+	if resp != nil {
+		resp.Body.Close()
+		t.Fatalf("aborted response became HTTP %d", resp.StatusCode)
+	}
+	if err == nil {
+		t.Fatal("expected a client-side transport failure")
+	}
+}
+
 func TestAsyncGatewayResponseDoesNotHoldStream(t *testing.T) {
 	t.Setenv("MAGPIE_BUN", testenv.Bun(t))
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())

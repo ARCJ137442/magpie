@@ -18,7 +18,9 @@ func gatewayResponse(w http.ResponseWriter, r *http.Request, proto provider.Prot
 	}}
 	return capture, func() {
 		defer capture.full.discard()
-		if streamOf(body) {
+		// A failed attempt can be recorded without writing a response: the
+		// native Codex path aborts the exchange on transport failure.
+		if streamOf(body) && capture.status < http.StatusBadRequest {
 			_ = http.NewResponseController(w).Flush()
 		}
 		output, err := capture.full.read()

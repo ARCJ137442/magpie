@@ -73,6 +73,10 @@ collector and renderer the gateway translates with (a Responses stream's
 client output. `ctx.request` contains the accepted request, `ctx.success` reports
 completion, and the same per-hook `ctx.state` links recall with capture.
 
+An attempt recorded as failed without a client response, such as a native
+Codex transport interruption, stays uncommitted: completion cleanup does not
+flush response headers before the server aborts the exchange.
+
 Notification is fire-and-forget, with a fresh timeout signal independent of the
 finished HTTP request. It never waits for an observer's network operation before
 returning client EOF. The run ends with the request handler, not with the client's

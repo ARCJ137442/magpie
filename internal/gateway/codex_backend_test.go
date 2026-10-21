@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -78,6 +79,67 @@ func TestCodexOwnModelPassesThrough(t *testing.T) {
 	if len(q.Input) != 3 || q.Input[0]["type"] != "message" || !strings.Contains(string(got), "did X, next Y") ||
 		q.Input[1]["encrypted_content"] != "openai-own" {
 		t.Errorf("input: %s", got)
+	}
+}
+
+// A transport failure before the ChatGPT backend answers is a network
+// failure to Codex, not an HTTP 502 response from magpie.
+func TestCodexOwnModelTransportFailureAbortsClientResponse(t *testing.T) {
+	setup(t, provider.Chat, &fake{t: t})
+	chatgpt(t, func(http.ResponseWriter, *http.Request) {
+		panic(http.ErrAbortHandler)
+	})
+
+	gw := httptest.NewServer(New().Handler())
+	t.Cleanup(gw.Close)
+	req, err := http.NewRequest(http.MethodPost, gw.URL+CodexPath+"/responses", strings.NewReader(`{"model":"gpt-5.5","input":"hi","stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer chatgpt-token")
+	resp, err := gw.Client().Do(req)
+	if resp != nil {
+		defer resp.Body.Close()
+		t.Fatalf("transport failure became HTTP %d: %s", resp.StatusCode, resp.Status)
+	}
+	if err == nil {
+		t.Fatal("expected a client-side transport failure, got an HTTP response")
+	}
+}
+
+func TestCodexOwnModelConfigurationErrorKeepsHTTPResponse(t *testing.T) {
+	setup(t, provider.Chat, &fake{t: t})
+	s := New()
+	s.client = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("certificate signed by unknown authority")
+	})}
+	gw := httptest.NewServer(s.Handler())
+	t.Cleanup(gw.Close)
+	req, err := http.NewRequest(http.MethodPost, gw.URL+CodexPath+"/responses", strings.NewReader(`{"model":"gpt-5.5","input":"hi","stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer chatgpt-token")
+	resp, err := gw.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("configuration error became HTTP %d, want 502", resp.StatusCode)
+	}
+}
+
+func TestCodexOwnModelUpstreamHTTPStatusIsPreserved(t *testing.T) {
+	setup(t, provider.Chat, &fake{t: t})
+	chatgpt(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		io.WriteString(w, `{"error":{"message":"upstream bad gateway","type":"api_error"}}`)
+	})
+	code, body := codexPost(t, `{"model":"gpt-5.5","input":"hi","stream":true}`)
+	if code != http.StatusBadGateway || !strings.Contains(body, "upstream bad gateway") {
+		t.Fatalf("upstream status changed: %d %s", code, body)
 	}
 }
 

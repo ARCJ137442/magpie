@@ -17,6 +17,20 @@ import (
 	"github.com/yetone/magpie/internal/usage"
 )
 
+func TestRecordResponseStatusDoesNotCommitResponse(t *testing.T) {
+	client := httptest.NewRecorder()
+	inner := &conversationWriter{captureResponseWriter: &captureResponseWriter{ResponseWriter: client}}
+	outer := &conversationWriter{captureResponseWriter: &captureResponseWriter{ResponseWriter: inner}}
+
+	recordResponseStatus(outer, http.StatusBadGateway)
+	if outer.status != http.StatusBadGateway || inner.status != http.StatusBadGateway {
+		t.Fatalf("wrapped conversation status: outer=%d inner=%d", outer.status, inner.status)
+	}
+	if client.Code != http.StatusOK || client.Body.Len() != 0 {
+		t.Fatalf("recording status wrote an HTTP response: code=%d body=%q", client.Code, client.Body.String())
+	}
+}
+
 func TestGatewayConversationCapture(t *testing.T) {
 	fresh(t)
 	serveOn(t, "fake", "k", []string{"m1"}, archiveVendor{})

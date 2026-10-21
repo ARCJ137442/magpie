@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"regexp"
 	"slices"
@@ -1088,6 +1089,16 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 				if rest == "/responses" {
 					msg = codexUnreached(modelOf(body), err)
 				}
+				if res == nil && base == provider.CodexBase && rest == "/responses" && on == nil && !apiKey(r.Header) &&
+					r.Context().Err() == nil && codexTransportInterrupted(err) {
+					// Codex treats a lost connection to its own backend as a
+					// network interruption and waits for it to return. An HTTP
+					// 502 here changes that signal into a bounded status retry.
+					// Abort the client-facing response without writing a status.
+					recordResponseStatus(w, http.StatusBadGateway)
+					end(http.StatusBadGateway, msg, 0, 0)
+					panic(http.ErrAbortHandler)
+				}
 				failWith(502, msg)
 				end(502, msg, 0, 0)
 				return
@@ -1541,6 +1552,28 @@ func codexUnreached(model string, err error) string {
 	return "OpenAI can't be reached (" + err.Error() + "). " + model + " is one of Codex's own models, " +
 		"which goes to OpenAI with Codex's own sign-in: pick one of magpie's models in Codex " +
 		"(provider/model, or set it in magpie's Agents view), or let Codex reach OpenAI"
+}
+
+// codexTransportInterrupted distinguishes a lost or timed-out network path
+// from local request and TLS configuration errors. Only the former should be
+// allowed to look like a native connection failure to Codex.
+func codexTransportInterrupted(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return dnsErr.Timeout() || dnsErr.Temporary()
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 // codexFailedEmpty says why a model of Codex's own failed when OpenAI gave

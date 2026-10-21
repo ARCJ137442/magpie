@@ -1,6 +1,10 @@
 package gateway
 
 import (
+	"errors"
+	"io"
+	"net"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -26,5 +30,26 @@ func TestCodexOwnModelUnreached(t *testing.T) {
 	if rec.Code != 502 || !strings.Contains(body, "OpenAI can't be reached") || !strings.Contains(body, "gpt-5.5 is one of Codex's own models") ||
 		!strings.Contains(body, "pick one of magpie's models") {
 		t.Fatalf("%d %s", rec.Code, body)
+	}
+}
+
+func TestCodexTransportInterrupted(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "EOF", err: io.EOF, want: true},
+		{name: "unexpected EOF", err: io.ErrUnexpectedEOF, want: true},
+		{name: "network operation", err: &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection reset")}, want: true},
+		{name: "temporary DNS", err: &net.DNSError{IsTemporary: true}, want: true},
+		{name: "permanent DNS", err: &net.DNSError{Err: "no such host"}},
+		{name: "local configuration", err: errors.New("certificate signed by unknown authority")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := codexTransportInterrupted(tc.err); got != tc.want {
+				t.Fatalf("codexTransportInterrupted(%v) = %t, want %t", tc.err, got, tc.want)
+			}
+		})
 	}
 }

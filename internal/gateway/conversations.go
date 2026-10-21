@@ -56,6 +56,27 @@ func (w *conversationWriter) WriteHeader(status int) {
 	w.ResponseWriter.WriteHeader(status)
 }
 
+func (w *conversationWriter) recordStatus(status int) {
+	if w.status == 0 {
+		w.status = status
+	}
+}
+
+// recordResponseStatus updates response metadata without committing a status
+// line to the client. It is used when the HTTP response itself is aborted.
+func recordResponseStatus(w http.ResponseWriter, status int) {
+	for depth := 0; w != nil && depth < 32; depth++ {
+		if recorder, ok := w.(interface{ recordStatus(int) }); ok {
+			recorder.recordStatus(status)
+		}
+		unwrapper, ok := w.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			return
+		}
+		w = unwrapper.Unwrap()
+	}
+}
+
 // recordConversation wraps the client-facing path, outside middleware and
 // translation, so retries never become duplicate assistant replies.
 func recordConversation(w http.ResponseWriter, r *http.Request, proto provider.Protocol, body []byte) (http.ResponseWriter, func()) {

@@ -9,11 +9,15 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand/v2"
 	"net"
 	"net/http"
+	"net/http/httptrace"
+	"net/url"
 	"regexp"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/tidwall/gjson"
@@ -1046,10 +1050,18 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 		// (holdWriter.stop)
 		attempt, cancel := context.WithCancel(r.Context())
 		defer cancel()
-		for tries := 0; ; tries++ {
+		transportRetries := 0
+		rewriteAttempts := 0
+		for {
 			ctx := provider.ViaSignedIn(attempt, "codex")
 			if on != nil {
 				ctx = on.Via(attempt)
+			}
+			var wroteHeaders atomic.Bool
+			if codexNativePassthrough(r, base, on, rest) {
+				ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+					WroteHeaders: func() { wroteHeaders.Store(true) },
+				})
 			}
 			req, err := http.NewRequestWithContext(ctx, r.Method, u, bytes.NewReader(body))
 			if err != nil {
@@ -1089,12 +1101,32 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 				if rest == "/responses" {
 					msg = codexUnreached(modelOf(body), err)
 				}
-				if res == nil && base == provider.CodexBase && rest == "/responses" && on == nil && !apiKey(r.Header) &&
+				if res == nil && codexNativePassthrough(r, base, on, rest) &&
+					r.Context().Err() == nil && !kept.sent &&
+					codexTransportUnsent(err, req.URL.String(), wroteHeaders.Load()) {
+					elapsed := time.Since(start)
+					if wait, retry := codexTransportRetryWait(transportRetries, elapsed); retry {
+						transportRetries++
+						lastWait := wait >= codexTransportRetryWindow-elapsed
+						timer := time.NewTimer(wait)
+						select {
+						case <-timer.C:
+							if !lastWait {
+								continue
+							}
+						case <-r.Context().Done():
+							timer.Stop()
+							recordResponseStatus(w, 499)
+							end(499, "Codex canceled while magpie waited to reconnect to OpenAI", 0, 0)
+							return
+						}
+					}
+				}
+				if res == nil && codexNativePassthrough(r, base, on, rest) &&
 					r.Context().Err() == nil && codexTransportInterrupted(err) {
-					// Codex treats a lost connection to its own backend as a
-					// network interruption and waits for it to return. An HTTP
-					// 502 here changes that signal into a bounded status retry.
-					// Abort the client-facing response without writing a status.
+					// The POST may have reached OpenAI. Do not replay a turn
+					// whose completion is unknown; abort without inventing an
+					// HTTP status or error body for the client.
 					recordResponseStatus(w, http.StatusBadGateway)
 					end(http.StatusBadGateway, msg, 0, 0)
 					panic(http.ErrAbortHandler)
@@ -1171,7 +1203,7 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 					}
 				}
 			}
-			if rest != "/responses" || tries >= 3 || (res.StatusCode != 400 && res.StatusCode != 404) {
+			if rest != "/responses" || rewriteAttempts >= 3 || (res.StatusCode != 400 && res.StatusCode != 404) {
 				break
 			}
 			// an item OpenAI can't take — sealed by another account, or
@@ -1186,6 +1218,7 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 				break
 			}
 			body = b
+			rewriteAttempts++
 		}
 		if rest == "/responses" {
 			// a web page or nothing at all, served 200, is the 502 it stands
@@ -1574,6 +1607,84 @@ func codexTransportInterrupted(err error) bool {
 	}
 	var netErr net.Error
 	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+// codexNativePassthrough is Codex's own Responses turn sent with Codex's
+// ChatGPT sign-in, without a magpie account or API key in the way.
+func codexNativePassthrough(r *http.Request, base string, on *provider.Provider, rest string) bool {
+	return base == provider.CodexBase && rest == "/responses" && on == nil && !apiKey(r.Header)
+}
+
+// codexProxyTunnelRefused recognizes the status text net/http leaves when an
+// HTTP proxy refuses CONNECT. The transport has not established TLS or sent
+// the Responses request at that point.
+func codexProxyTunnelRefused(err error) bool {
+	if err == nil {
+		return false
+	}
+	var requestErr *url.Error
+	if errors.As(err, &requestErr) {
+		err = requestErr.Err
+	}
+	if err == nil {
+		return false
+	}
+	switch strings.TrimSpace(err.Error()) {
+	case "Bad Gateway", "Service Unavailable", "Gateway Timeout":
+		return true
+	default:
+		return false
+	}
+}
+
+// codexTransportUnsent says no origin request headers were written and the
+// error is a transient network failure. The httptrace flag makes an EOF during
+// proxy CONNECT distinguishable from an EOF after the Responses POST went out.
+// Once origin headers were written, the turn may have been accepted, so the
+// retry loop must not send it a second time.
+func codexTransportUnsent(err error, requestURL string, requestHeadersWritten bool) bool {
+	if requestHeadersWritten {
+		return false
+	}
+	var requestErr *url.Error
+	if !errors.As(err, &requestErr) || requestErr.URL != requestURL {
+		return false
+	}
+	if codexProxyTunnelRefused(requestErr.Err) {
+		return true
+	}
+	if errors.Is(requestErr.Err, io.EOF) || errors.Is(requestErr.Err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var dnsErr *net.DNSError
+	if errors.As(requestErr.Err, &dnsErr) {
+		return dnsErr.Timeout() || dnsErr.Temporary()
+	}
+	var opErr *net.OpError
+	if errors.As(requestErr.Err, &opErr) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(requestErr.Err, &netErr) && netErr.Timeout()
+}
+
+// codexTransportRetryWait backs off this request's safe reconnect loop with
+// jitter, so calls that lost the same proxy together don't redial in lockstep.
+// It stops after codexTransportRetryWindow from the request's start.
+const codexTransportRetryWindow = 10 * time.Minute
+
+func codexTransportRetryWait(attempt int, elapsed time.Duration) (time.Duration, bool) {
+	remaining := codexTransportRetryWindow - elapsed
+	if remaining <= 0 {
+		return 0, false
+	}
+	const longest = 30 * time.Second
+	wait := min(max(retryPause, time.Millisecond), longest)
+	for i := 0; i < min(attempt, 5); i++ {
+		wait = min(wait*2, longest)
+	}
+	wait = wait - wait/4 + time.Duration(rand.Int64N(int64(wait/4)+1))
+	return min(wait, remaining), true
 }
 
 // codexFailedEmpty says why a model of Codex's own failed when OpenAI gave

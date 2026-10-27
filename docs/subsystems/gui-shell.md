@@ -700,3 +700,7 @@ still follows the existing Not set up folding rules. The dialog explains that
 restoring visibility does not pin an unconfigured agent into the main list.
 See `agent-bulk-visibility.test.cjs` for persistence, partial selection, failed
 saves, narrow layouts and all five languages in Chromium and WebKit.
+
+## Object and field settings navigation
+
+See [settings-navigation](settings-navigation.md) for the opt-in behavior, boundaries and verification requirements.

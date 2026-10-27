@@ -1,0 +1,12 @@
+.settings-command { box-sizing:border-box; width:min(760px,calc(100vw - 32px)); max-height:82vh; padding:20px; border:1px solid var(--line); border-radius:14px; background:var(--card); color:var(--fg); }
+.settings-command::backdrop { background:rgb(0 0 0 / .4); }
+.settings-command h2 { margin:0 0 14px; font-size:1.1rem; }
+.settings-command input { box-sizing:border-box; width:100%; }
+.settings-command-results { max-height:55vh; overflow:auto; margin-top:12px; }
+.settings-command-result { padding:9px 10px; border-radius:8px; overflow-wrap:anywhere; }
+.settings-command-result[aria-selected=true] { background:var(--pill-hover); outline:1px solid var(--muted); outline-offset:-1px; }
+.settings-command-result .hint { margin-top:4px; }
+.settings-command-open { margin-inline:8px; --wails-draggable:no-drag; }
+.settings-find-editor { margin-inline-start:auto; }
+.nav-focus { outline:2px solid currentColor !important; outline-offset:3px; }
+@media(prefers-reduced-motion:reduce) { .settings-command * { scroll-behavior:auto; } }

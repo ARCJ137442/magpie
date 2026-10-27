@@ -608,6 +608,17 @@ func vendorSaid(b []byte, status string) string {
 // a Zhipu or Z.ai key with no plan of its own is a team's, whose windows
 // are asked with type=2 (zcode_team.go), and team says so.
 func planKeyWindows(ctx context.Context, p Provider, src planQuotaSource, key string) (plan string, ws []QuotaWindow, team bool, err error) {
+	ctx = quotaReadContext(ctx)
+	guardProvider := p
+	guardProvider.Key = key
+	guardRead := beginQuotaObservation(ctx, guardProvider)
+	defer func() {
+		if err == nil {
+			if guardErr := guardRead.windows(ws); guardErr != nil {
+				err = guardErr
+			}
+		}
+	}()
 	if hostOf(src.url) == "api.commandcode.ai" {
 		plan, ws, err = cmdKeyWindows(ctx, src, key)
 		return plan, ws, false, err

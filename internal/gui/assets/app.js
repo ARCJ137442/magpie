@@ -8943,6 +8943,7 @@ function renderEditor(p, presetID) {
   keptIcons = null;
   try {
     const editor = drawEditor(p, presetID);
+    window.magpieSettingsNav?.mountEditor(editor, p);
     if (draft && draft !== providerDraftRef) {
       providerDraftRef = draft;
       providerDraftBase = providerDraftValue();

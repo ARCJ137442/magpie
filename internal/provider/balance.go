@@ -1208,6 +1208,16 @@ func Balance(ctx context.Context, p Provider) (amount string, ok bool, err error
 // key's own usage windows when its reply tells them (a sub2api key's
 // limits, readSub2APIKeyLimits).
 func balanceRead(ctx context.Context, p Provider) (amount string, parts, split []BalancePart, ws []QuotaWindow, ok bool, err error) {
+	ctx = quotaReadContext(ctx)
+	guardRead := beginQuotaObservation(ctx, p)
+	var guardRaw []byte
+	defer func() {
+		if err == nil && ok && len(guardRaw) != 0 {
+			if guardErr := guardRead.balance(guardRaw, ws); guardErr != nil {
+				err = guardErr
+			}
+		}
+	}()
 	ctx = p.Via(ctx)
 	p = keyQueryOf(p)
 	src, ok := balanceSourceOf(p)
@@ -1265,7 +1275,11 @@ func balanceRead(ctx context.Context, p Provider) (amount string, parts, split [
 		return "", nil, nil, nil, true, err
 	}
 	defer res.Body.Close()
-	b, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+	b, guardBodyErr := io.ReadAll(io.LimitReader(res.Body, (1<<20)+1))
+	if guardBodyErr != nil || len(b) > 1<<20 {
+		return "", nil, nil, nil, true, errors.New("balance response could not be read completely")
+	}
+	guardRaw = b
 	if msg, refused := balanceRefusal(b); refused {
 		// said as the relay says it, whatever the status: not a field
 		// missing from a reply that was never the balance

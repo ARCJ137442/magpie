@@ -2777,12 +2777,15 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		held := false          // answered as its vendor did a moment ago, without asking
 		var heldBack time.Time // when the first of those held out of their allowance is back
 		var queued int64       // ms it waited for a slot of its key's or account's
-		var laneErr error      // turned away by its key's or account's queue
-		at := &wireAt{}        // the level a translated request was built at
+		var laneErr error
+		quotaErr := provider.CheckQuotaGuard(r.Context(), c.p)
+		at := &wireAt{} // the level a translated request was built at
 		// the models Copilot's Auto picked for it, where from, and which
 		// were refused (#256)
 		autoPicked := func() []provider.AutoPick { return nil }
-		if said, ok := verifyHeld(c); ok && last {
+		if quotaErr != nil {
+			// Local policy is not an upstream failure or a probe opportunity.
+		} else if said, ok := verifyHeld(c); ok && last {
 			// the account must be verified first (#152): the agent's
 			// reconnects are told so again, not sent on to a vendor that
 			// just refused it
@@ -2869,10 +2872,44 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 					defer release()
 					defer hw.watch()()
 					defer notePhase(ctx, "upstream")()
+					// Recheck after lane/RPM waits; Provider.Do also gates physical retries.
+					quotaErr = provider.CheckQuotaGuard(ctx, c.p)
+					if quotaErr != nil {
+						return
+					}
+					ctx = provider.WithQuotaSendReport(ctx)
 					call.Status, call.Error = s.attempt(hw, r.WithContext(ctx), from, c.p, c.model, attemptBody, &call)
+					if denied := provider.QuotaSendFailure(ctx); denied != nil {
+						quotaErr = denied
+					}
 				}()
 			}
 			stop()
+		}
+		if quotaErr != nil {
+			var local *provider.QuotaGuardError
+			code := "upstream_quota_unknown"
+			call.Status, call.Error = http.StatusServiceUnavailable, "upstream quota protection is unavailable"
+			if errors.As(quotaErr, &local) {
+				call.Status, call.Error, code = local.Status(), local.Error(), local.Code()
+			}
+			call.Usage.ErrType = code
+			s.trace.update(tr, func(t *Route) {
+				tt := &t.Tries[len(t.Tries)-1]
+				tt.Done, tt.Status, tt.Error, tt.Millis = true, call.Status, call.Error, time.Since(start).Milliseconds()
+			})
+			if !last {
+				skipped = append(skipped, c.label()+": "+call.Error)
+				continue
+			}
+			if !kept.sent {
+				w.Header().Set("X-Magpie-Quota-Guard", code)
+				w.Header().Del("Retry-After")
+			}
+			failTo(w, kept, from, call.Status, call.Error)
+			call.Millis = time.Since(start).Milliseconds()
+			logged()
+			break
 		}
 		if laneErr != nil {
 			// its key's or account's queue was full, or it waited as long
@@ -3845,6 +3882,16 @@ func sinceStart(before, d time.Duration) int64 {
 // attempt sends a request to one provider. call.To stays empty when the
 // provider has no endpoint to send it to.
 func (s *Server) attempt(w http.ResponseWriter, r *http.Request, from provider.Protocol, p provider.Provider, model string, body []byte, call *Call) (int, string) {
+	if err := provider.AdmitQuotaAttempt(r.Context(), p); err != nil {
+		var held *provider.QuotaGuardError
+		status := http.StatusServiceUnavailable
+		if errors.As(err, &held) {
+			status = held.Status()
+			call.Usage.ErrType = held.Code()
+		}
+		writeError(w, from, status, err.Error())
+		return status, err.Error()
+	}
 	// Normalize for the actual destination, separately on each fallback.
 	// Native ChatGPT accounts accept standalone tool outputs themselves.
 	if from == provider.Responses && (p.Account == nil || p.Account.Agent != "codex") {

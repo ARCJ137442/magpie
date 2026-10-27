@@ -7482,6 +7482,7 @@ function providerDraftValue() {
   return JSON.stringify({ ...draft, headers: headersOf(draft?.headers), modelPrefs: modelPrefsOfDraft() });
 }
 function providerDirty() {
+  if (window.magpieQuotaGuard?.dirty(editing)) return true;
   // Price boxes parse on change; a page closed while typing hasn't blurred one yet.
   const active = document.activeElement;
   if (accountModelsDraft(providers?.providers?.find((p) => p.id === editing)) !== null) return true;
@@ -7552,8 +7553,10 @@ function confirmAction(title, message, action) {
 function confirmRemoval(name, consequence = "This removes the selected item. Continue?") {
   return confirmAction(t("Remove {name}?", { name }), t(consequence), t("Remove"));
 }
-function confirmDiscard() {
-  return confirmAction(t("Discard"), t("Discard unsaved changes? Your changes will be lost."), t("Discard"));
+async function confirmDiscard() {
+  const yes = await confirmAction(t("Discard"), t("Discard unsaved changes? Your changes will be lost."), t("Discard"));
+  if (yes) window.magpieQuotaGuard?.discard(editing);
+  return yes;
 }
 async function cancelEdit(keep) {
   if ((providerDirty() || ((importing || importingApps) && modalFormDirty())) && !(await confirmDiscard())) return false;
@@ -8943,6 +8946,7 @@ function renderEditor(p, presetID) {
   keptIcons = null;
   try {
     const editor = drawEditor(p, presetID);
+    window.magpieQuotaGuard?.mount(editor, p);
     if (draft && draft !== providerDraftRef) {
       providerDraftRef = draft;
       providerDraftBase = providerDraftValue();

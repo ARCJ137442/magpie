@@ -1,0 +1,13 @@
+/* The provider editor's own semantic surface; no new theme or global styles. */
+.quota-guard { grid-column: 1 / -1; width: 100%; box-sizing: border-box; margin: 0; padding: 0; }
+.quota-guard > summary { padding: 10px 0; border-top: 1px solid var(--line-2); }
+.quota-guard > summary { cursor: pointer; font-weight: 600; }
+.quota-guard-content { display: grid; gap: 12px; padding-top: 12px; }
+.quota-key-picker, .quota-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.quota-key-picker [aria-pressed="true"] { background: var(--pill); font-weight: 600; }
+.quota-key-form { display: grid; gap: 12px; }
+.quota-rule label, .quota-custom label { display: grid; grid-template-columns: minmax(120px, 1fr) minmax(160px, 1fr); align-items: center; gap: 12px; }
+.quota-toggle { display: flex; align-items: center; gap: 8px; }
+.quota-guard input { min-width: 0; max-width: 100%; }
+.quota-status, .quota-guard .err { overflow-wrap: anywhere; }
+@media (max-width: 600px) { .quota-rule label, .quota-custom label { grid-template-columns: 1fr; } }

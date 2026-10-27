@@ -302,3 +302,7 @@ real `~/.codex`, `~/.claude`, `~/.config/gcloud` or `~/.config/magpie` files.
 Vertex AI's tests send Vertex AI, Google's token endpoint and IAM Credentials
 to a server of their own (`VertexForTest`). Check a change
 against real accounts in a sandbox HOME, as [Code standards](../code-standards.md#acceptance-criteria) describes.
+
+## Upstream credential reserve protection
+
+See [upstream-quota-guard](upstream-quota-guard.md) for the opt-in behavior, boundaries and verification requirements.

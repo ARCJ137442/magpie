@@ -119,6 +119,9 @@ func (s *Server) kimiSearch(ctx context.Context, p provider.Provider, query stri
 	if id, _ := ctx.Value(searchCallKey{}).(string); id != "" {
 		r.Header.Set("X-Msh-Tool-Call-Id", id)
 	}
+	if err := provider.AdmitQuotaAttempt(ctx, p); err != nil {
+		return "", nil, err
+	}
 	res, err := s.client.Do(r)
 	if err != nil {
 		if ctx.Err() != nil {

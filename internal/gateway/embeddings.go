@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -221,8 +222,30 @@ func (s *Server) serveRetrieval(w http.ResponseWriter, r *http.Request, path, op
 			s.record(call)
 			return
 		}
+		if err := provider.CheckQuotaGuard(r.Context(), c.p); err != nil {
+			if !last {
+				skipped = append(skipped, c.label()+": "+err.Error())
+				continue
+			}
+			var local *provider.QuotaGuardError
+			call.Status, call.Error = http.StatusServiceUnavailable, "upstream quota protection is unavailable"
+			if errors.As(err, &local) {
+				call.Status, call.Error, call.Usage.ErrType = local.Status(), local.Error(), local.Code()
+			}
+			call.Millis = time.Since(start).Milliseconds()
+			writeError(w, provider.Chat, call.Status, call.Error)
+			s.record(call)
+			return
+		}
 		ctx, cancel := context.WithTimeout(r.Context(), retrieveTimeout)
+		ctx = provider.WithQuotaSendReport(ctx)
 		b, got, code, err := s.retrieveAs(ctx, c.p, base+path, ctype, out)
+		if denied := provider.QuotaSendFailure(ctx); denied != nil {
+			// A guard that trips after planning is still a local refusal,
+			// never the retrieval helper's generic upstream error.
+			code, call.Usage.ErrType, call.Error = provider.GuardFailureFor(denied)
+			err = denied
+		}
 		cancel()
 		call.Millis = time.Since(start).Milliseconds()
 		if err != nil && !last && r.Context().Err() == nil {

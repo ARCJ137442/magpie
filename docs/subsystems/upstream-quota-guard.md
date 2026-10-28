@@ -48,13 +48,14 @@ Existing account caps are not silently migrated to latched semantics. The first
 editor integration is for API keys; subscription migration needs explicit behavior
 tests and a user-visible compatibility decision.
 
-The accompanying source candidate has not been built or tested. Before release,
-audit all HTTP/SDK/stream/compaction/search/image/decision senders and retry paths,
-verify backup/restore/sync policy (do not sync active human overrides), and test
-native GUI draft/confirmation behavior. Unregistered or unverified paths must not
-be advertised as a completed economic-safety guarantee.
+## Verification and remaining coverage
 
-Verification sources: `internal/quotaguard/*_test.go`,
-`internal/provider/quota_guard_test.go`, and
-`internal/gateway/quota_guard_test.go`. The central integration assertion is zero
-model-upstream requests after protection, not merely a particular HTTP status.
+The rule evaluator, persistent store, provider adapter and selected gateway paths have focused tests. The central integration assertion is zero model-upstream requests after protection, not merely a particular HTTP status.
+
+```sh
+go test -tags nogui ./internal/quotaguard
+go test -tags nogui ./internal/provider -run 'TestGuard'
+go test -tags nogui ./internal/gateway -run 'TestQuotaGuard'
+```
+
+These checks do not cover every sender. Before treating the guard as a general spending limit, audit HTTP, SDK, streaming, compaction, search, image and decision paths, including internal retry boundaries and error classification. Also define backup, restore and sync behavior; active human overrides should not be extended to another device automatically. Test GUI confirmation and cross-process updates. Unverified paths must not be presented as covered.

@@ -17,6 +17,29 @@ change the policy, re-arm after a fresh recovered observation, or grant a bounde
 override. The GUI offers 15 minutes; the API permits at most 24 hours. An override
 never enables a manually disabled key or makes unknown data valid.
 
+## Refresh sensitivity
+
+Refresh sensitivity belongs to the opt-in quota policy for a credential. It does
+not change how the Usage page or ordinary provider balance cards refresh. The
+quota editor initially shows its saved observation; its refresh action asks the
+existing upstream balance or plan reader again. A gateway attempt also refreshes
+when its saved observation is unknown or older than the policy's maximum age.
+
+- **Cached** is the default for existing and new policies: an accepted reading
+  may be reused until `maxAgeSeconds` (60 seconds by default; configurable from
+  5 to 600).
+- **Near reserve** lets each rule set `refreshWithin` in that metric's unit. When
+  a fresh reading is at or below `minimum + refreshWithin`, the last common
+  sender gate asks for another reading before each physical attempt.
+- **Every attempt** asks for a fresh reading before each physical attempt,
+  regardless of distance from the reserve.
+
+The common sender applies near/strict refreshes to retries as well as the first
+send. Simultaneous checks for one credential share an in-flight quota read to
+avoid bursting the vendor's usage endpoint. They do not reserve future spend or
+serialize model requests, so parallel in-flight consumption can still cross a
+reserve. A reading may also lag the vendor's own accounting.
+
 ## Observation and storage
 
 `internal/quotaguard` contains the rule evaluator and revisioned persistent store.

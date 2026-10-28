@@ -6,6 +6,9 @@
 .quota-key-picker, .quota-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .quota-key-picker [aria-pressed="true"] { background: var(--pill); font-weight: 600; }
 .quota-key-form { display: grid; gap: 12px; }
+.quota-refresh-settings { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+.quota-refresh-settings label { display: grid; gap: 6px; }
+.quota-refresh-settings .hint { grid-column: 1 / -1; }
 .quota-rule label, .quota-custom label { display: grid; grid-template-columns: minmax(120px, 1fr) minmax(160px, 1fr); align-items: center; gap: 12px; }
 .quota-toggle { display: flex; align-items: center; gap: 8px; }
 .quota-guard input { min-width: 0; max-width: 100%; }

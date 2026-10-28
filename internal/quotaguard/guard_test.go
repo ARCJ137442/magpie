@@ -121,3 +121,51 @@ func TestUnknownAloneDoesNotLatch(t *testing.T) {
 		t.Fatal("unknown became permanent trip")
 	}
 }
+
+func TestNearReserveRangeIsUnitAware(t *testing.T) {
+	now := time.Now()
+	e := fixture(now, "35")
+	e.Policy.RefreshMode = RefreshModeNearReserve
+	e.Policy.Rules[0].Minimum = "30"
+	e.Policy.Rules[0].RefreshWithin = "5"
+	if err := e.Policy.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if d := Assess(e, true, now); !d.Allowed || !d.NearReserve {
+		t.Fatalf("exact near-band boundary: %+v", d)
+	}
+	s := e.Snapshots["windows"]
+	s.Metrics[0].Remaining = "35.000001"
+	e.Snapshots["windows"] = s
+	if d := Assess(e, true, now); !d.Allowed || d.NearReserve {
+		t.Fatalf("outside near band: %+v", d)
+	}
+	s.Metrics[0].Remaining = "30"
+	e.Snapshots["windows"] = s
+	if d := Assess(e, true, now); d.Allowed || !d.Protected || !d.NearReserve {
+		t.Fatalf("at reserve: %+v", d)
+	}
+}
+
+func TestRefreshModesValidate(t *testing.T) {
+	now := time.Now()
+	e := fixture(now, "80")
+	for _, mode := range []string{"", RefreshModeCached, RefreshModeEveryAttempt} {
+		e.Policy.RefreshMode = mode
+		if err := e.Policy.Validate(); err != nil {
+			t.Errorf("mode %q: %v", mode, err)
+		}
+	}
+	e.Policy.RefreshMode = RefreshModeNearReserve
+	if err := e.Policy.Validate(); err == nil {
+		t.Fatal("near mode without a range was accepted")
+	}
+	e.Policy.Rules[0].RefreshWithin = "5"
+	if err := e.Policy.Validate(); err != nil {
+		t.Fatalf("near mode with range: %v", err)
+	}
+	e.Policy.RefreshMode = "unknown"
+	if err := e.Policy.Validate(); err == nil {
+		t.Fatal("unknown refresh mode was accepted")
+	}
+}

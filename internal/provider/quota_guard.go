@@ -208,6 +208,13 @@ func guardUnavailable() error {
 // including a retry within one logical attempt. Already admitted/in-flight
 // requests are not aborted; no request's future consumption is reserved.
 func CheckQuotaGuard(ctx context.Context, p Provider) error {
+	return checkQuotaGuard(ctx, p, false)
+}
+
+// checkQuotaGuard checks the saved observation for a route candidate. A
+// physical send uses beforeAttempt to apply the policy's selected freshness
+// mode at its last common gate.
+func checkQuotaGuard(ctx context.Context, p Provider, beforeAttempt bool) error {
 	if p.Key == "" && p.Account == nil {
 		return nil
 	}
@@ -224,8 +231,22 @@ func CheckQuotaGuard(ctx context.Context, p Provider) error {
 	}
 	d := quotaguard.Assess(e, true, time.Now())
 	_, readHere := guardReadThisProcess.Load(guardReadID(p, id, e.Revision))
-	if d.Unknown || !readHere {
-		if err = refreshQuotaGuardOnce(ctx, p, id); err != nil {
+	forceFresh := false
+	if beforeAttempt && d.Allowed {
+		switch e.Policy.RefreshMode {
+		case quotaguard.RefreshModeNearReserve:
+			forceFresh = d.NearReserve
+		case quotaguard.RefreshModeEveryAttempt:
+			forceFresh = true
+		}
+	}
+	// Cached mode performs an initial read for this process before it admits
+	// a credential. Near/strict modes defer a fresh read to the physical-send
+	// gate unless the stored observation is unknown or stale; this avoids
+	// fetching twice merely because routing planned the request.
+	needRead := d.Unknown || (!readHere && e.Policy.RefreshMode == quotaguard.RefreshModeCached) || forceFresh
+	if needRead {
+		if err = refreshQuotaGuardOnce(ctx, p, id, forceFresh); err != nil {
 			return guardUnavailable()
 		}
 		_, e, err = quotaGuardEntry(p)
@@ -538,7 +559,7 @@ type guardRefreshCall struct {
 	err   error
 }
 
-func refreshQuotaGuardOnce(ctx context.Context, p Provider, id string) error {
+func refreshQuotaGuardOnce(ctx context.Context, p Provider, id string, forceFresh bool) error {
 	// Include the data directory: isolated instances/tests cannot share reads.
 	_, entry, readErr := quotaGuardEntry(p)
 	if readErr != nil {
@@ -559,7 +580,10 @@ func refreshQuotaGuardOnce(ctx context.Context, p Provider, id string) error {
 				return prior.err
 			}
 		}
-		if time.Since(prior.ended) < 5*time.Second {
+		// Cached mode coalesces very recent completed reads. Near/strict
+		// attempt modes require a new observation for this physical send;
+		// simultaneous sends still share an in-flight read to avoid a burst.
+		if !forceFresh && time.Since(prior.ended) < 5*time.Second {
 			quotaGuardRefresh.Unlock()
 			return prior.err
 		}
@@ -622,7 +646,7 @@ func guardBeforeSend(ctx context.Context, p Provider) error {
 	if read, _ := ctx.Value(quotaReadContextKey{}).(bool); read {
 		return nil
 	}
-	err := CheckQuotaGuard(ctx, p)
+	err := checkQuotaGuard(ctx, p, true)
 	if err != nil {
 		if report, _ := ctx.Value(quotaSendReportKey{}).(*quotaSendReport); report != nil {
 			report.Lock()

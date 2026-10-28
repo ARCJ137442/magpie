@@ -14,14 +14,24 @@ import (
 )
 
 type guardCalls struct {
-	primary atomic.Int64
-	spare   atomic.Int64
+	primary        atomic.Int64
+	spare          atomic.Int64
+	balance        atomic.Int64
+	primaryBalance atomic.Int64
 }
 
 func (c *guardCalls) total() int64 { return c.primary.Load() + c.spare.Load() }
 
 // All responses are local fixtures. No key, vendor or billable service is used.
 func guardFixture(t *testing.T) (provider.Provider, *guardCalls) {
+	return guardFixtureWithBalances(t, []string{"9.99"}, quotaguard.Policy{
+		Enabled:        true,
+		Rules:          []quotaguard.Rule{{Metric: "balance:custom", Unit: "CNY", Minimum: "10"}},
+		BalancePointer: "/data/balance", BalanceUnit: "CNY",
+	})
+}
+
+func guardFixtureWithBalances(t *testing.T, balances []string, policy quotaguard.Policy) (provider.Provider, *guardCalls) {
 	t.Helper()
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("HOME", t.TempDir())
@@ -31,10 +41,15 @@ func guardFixture(t *testing.T) (provider.Provider, *guardCalls) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.URL.Path == "/balance" {
+			count.balance.Add(1)
 			if strings.Contains(r.Header.Get("Authorization"), "spare") {
 				fmt.Fprint(w, `{"data":{"balance":"50"}}`)
 			} else {
-				fmt.Fprint(w, `{"data":{"balance":"9.99"}}`)
+				i := int(count.primaryBalance.Add(1) - 1)
+				if i >= len(balances) {
+					i = len(balances) - 1
+				}
+				fmt.Fprintf(w, `{"data":{"balance":%q}}`, balances[i])
 			}
 			return
 		}
@@ -59,7 +74,12 @@ func guardFixture(t *testing.T) (provider.Provider, *guardCalls) {
 	if err := provider.Save(p); err != nil {
 		t.Fatal(err)
 	}
-	configureGuard(t, p, "10")
+	if _, err := provider.ConfigureQuotaGuard(p, policy, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.RefreshQuotaGuard(context.Background(), p, nil); err != nil {
+		t.Fatal(err)
+	}
 	return p, count
 }
 
@@ -133,5 +153,58 @@ func TestQuotaGuardProviderDoCannotProbeHeldKey(t *testing.T) {
 	}
 	if count.total() != 0 {
 		t.Fatal("local refusal reached vendor")
+	}
+}
+
+func TestQuotaGuardNearReserveRefreshesBeforePhysicalAttempt(t *testing.T) {
+	policy := quotaguard.Policy{
+		Enabled:        true,
+		RefreshMode:    quotaguard.RefreshModeNearReserve,
+		Rules:          []quotaguard.Rule{{Metric: "balance:custom", Unit: "CNY", Minimum: "10", RefreshWithin: "1"}},
+		BalancePointer: "/data/balance", BalanceUnit: "CNY",
+	}
+	p, count := guardFixtureWithBalances(t, []string{"10.5", "9.99"}, policy)
+	if count.balance.Load() != 1 {
+		t.Fatalf("setup balance reads=%d, want 1", count.balance.Load())
+	}
+	w := postGuard(t, New(), p)
+	if count.balance.Load() != 2 || count.total() != 0 || w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "upstream_quota_protected") {
+		t.Fatalf("balance reads=%d model calls=%d status=%d body=%s", count.balance.Load(), count.total(), w.Code, w.Body.String())
+	}
+}
+
+func TestQuotaGuardNearReserveKeepsCacheFarFromReserve(t *testing.T) {
+	policy := quotaguard.Policy{
+		Enabled:        true,
+		RefreshMode:    quotaguard.RefreshModeNearReserve,
+		Rules:          []quotaguard.Rule{{Metric: "balance:custom", Unit: "CNY", Minimum: "10", RefreshWithin: "1"}},
+		BalancePointer: "/data/balance",
+		BalanceUnit:    "CNY",
+	}
+	p, count := guardFixtureWithBalances(t, []string{"50"}, policy)
+	w := postGuard(t, New(), p)
+	if count.balance.Load() != 1 || count.primary.Load() != 1 || w.Code != http.StatusOK {
+		t.Fatalf("balance reads=%d model calls=%d status=%d body=%s", count.balance.Load(), count.primary.Load(), w.Code, w.Body.String())
+	}
+}
+
+func TestQuotaGuardStrictModeRefreshesEveryPhysicalAttempt(t *testing.T) {
+	policy := quotaguard.Policy{
+		Enabled:        true,
+		RefreshMode:    quotaguard.RefreshModeEveryAttempt,
+		Rules:          []quotaguard.Rule{{Metric: "balance:custom", Unit: "CNY", Minimum: "10"}},
+		BalancePointer: "/data/balance", BalanceUnit: "CNY",
+	}
+	p, count := guardFixtureWithBalances(t, []string{"50"}, policy)
+	if count.balance.Load() != 1 {
+		t.Fatalf("setup balance reads=%d, want 1", count.balance.Load())
+	}
+	for i := 0; i < 2; i++ {
+		if err := provider.AdmitQuotaAttempt(context.Background(), p); err != nil {
+			t.Fatalf("attempt %d: %v", i, err)
+		}
+	}
+	if count.balance.Load() != 3 || count.total() != 0 {
+		t.Fatalf("balance reads=%d model calls=%d; want 3 reads and no model calls", count.balance.Load(), count.total())
 	}
 }

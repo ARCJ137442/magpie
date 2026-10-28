@@ -3,7 +3,7 @@
   "use strict";
   const sessions = new Map();
   const copy = (x) => JSON.parse(JSON.stringify(x));
-  const blank = () => ({ enabled: false, rules: [], maxAgeSeconds: 60 });
+  const blank = () => ({ enabled: false, rules: [], maxAgeSeconds: 60, refreshMode: "cached" });
   const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
   const word = (s, args) => t(s, args);
   function node(tag, cls, text) {
@@ -55,7 +55,10 @@
     const current = () => section.isConnected && s.generation === generation && sessions.get(p.id) === s;
     const keyState = () => {
       if (!s.keys.has(s.selected)) s.keys.set(s.selected, {});
-      return s.keys.get(s.selected);
+      const k = s.keys.get(s.selected);
+      if (!k.nearRanges) k.nearRanges = new Map();
+      if (k.ageInvalid === undefined) k.ageInvalid = false;
+      return k;
     };
     function drawKeys() {
       keys.replaceChildren();
@@ -87,6 +90,23 @@
     }
     async function perform(action, extra = {}) {
       const id = s.selected, k = keyState(); if (k.busy || !k.view) return;
+      if (action === "configure" && extra.policy?.refreshMode !== "everyAttempt" && k.ageInvalid) {
+        k.error = word("Reading age must be between 5 and 600 seconds");
+        draw(); return;
+      }
+      const nearRules = extra.policy?.rules || [];
+      const validNearRange = (value) => /^\+?\d+(?:\.\d+)?$/.test(String(value || "")) && Number(value) > 0;
+      if (action === "configure" && nearRules.some((r) => r.refreshWithin && !validNearRange(r.refreshWithin))) {
+        k.error = word("Near-reserve range must be a positive decimal number");
+        draw(); return;
+      }
+      if (action === "configure" && extra.policy?.refreshMode === "near") {
+        const hasRange = nearRules.some((r) => validNearRange(r.refreshWithin));
+        if (!hasRange) {
+          k.error = word("Near-reserve mode needs a positive range on at least one rule");
+          draw(); return;
+        }
+      }
       k.busy = true; const operation = Symbol(action); k.operation = operation; k.error = ""; draw();
       try {
         const v = await api("providers/quota-guard", { provider: p.id, key: id, action, revision: k.view.entry.revision, ...extra }, undefined, s.controller.signal);
@@ -119,12 +139,42 @@
       if (d.manualOff) facts.push(word("Manually disabled"));
       if (d.protected) facts.push(word("Reserve protection latched"));
       if (d.unknown) facts.push(word("Quota unknown"));
+      if (d.nearReserve && policy.refreshMode === "near") facts.push(word("Near reserve; refreshing every attempt"));
       if (d.overrideActive) facts.push(word("Override until {time}", { time: new Date(d.overrideUntil).toLocaleString() }));
       if (!facts.length) facts.push(word(d.guardEnabled ? "Protection armed" : "Protection not enabled"));
       const state = node("p", "hint quota-status", facts.join(" · ")); state.setAttribute("role", "status"); form.append(state);
       const enabled = node("input"); enabled.type = "checkbox"; enabled.checked = !!policy.enabled; enabled.disabled = !!k.busy;
       const enabledLabel = node("label", "quota-toggle"); enabledLabel.append(enabled, document.createTextNode(word("Enable this key's quota protection")));
       enabled.onchange = () => { policy.enabled = enabled.checked; }; form.append(enabledLabel);
+      const refreshSettings = node("div", "quota-refresh-settings");
+      const refreshModeLabel = node("label", "", word("Quota refresh strategy"));
+      const refreshMode = node("select", "words");
+      for (const [value, label] of [
+        ["cached", "Use cached readings until stale"],
+        ["near", "Refresh near the reserve"],
+        ["everyAttempt", "Refresh before every attempt"],
+      ]) {
+        const option = node("option", "", word(label)); option.value = value; refreshMode.append(option);
+      }
+      refreshMode.value = policy.refreshMode || "cached"; refreshMode.disabled = !!k.busy;
+      refreshMode.onchange = () => { policy.refreshMode = refreshMode.value; if (refreshMode.value === "everyAttempt") k.ageInvalid = false; draw(); };
+      refreshModeLabel.append(refreshMode); refreshSettings.append(refreshModeLabel);
+      const ageLabel = node("label", "", word("Maximum reading age (seconds)"));
+      const age = node("input", "words"); age.type = "number"; age.min = "5"; age.max = "600"; age.step = "1";
+      age.value = String(policy.maxAgeSeconds || 60); age.disabled = !!k.busy || refreshMode.value === "everyAttempt";
+      age.onchange = () => {
+        const n = Number(age.value);
+        if (!Number.isInteger(n) || n < 5 || n > 600) {
+          k.ageInvalid = true;
+        } else { policy.maxAgeSeconds = n; k.ageInvalid = false; k.error = ""; }
+      };
+      ageLabel.append(age); refreshSettings.append(ageLabel);
+      const modeHint = {
+        cached: "Reuse a recent reading; refresh when it expires",
+        near: "Near-reserve mode refreshes per attempt inside the configured band",
+        everyAttempt: "Every-attempt refresh adds latency and upstream quota reads",
+      };
+      refreshSettings.append(node("p", "hint", word(modeHint[refreshMode.value]))); form.append(refreshSettings);
       const snapshots = k.snapshots || Object.values(k.view.entry.snapshots || {});
       const metrics = new Map();
       for (const snap of snapshots) for (const m of snap.metrics || []) metrics.set(m.id, { ...m, at: snap.observedAt });
@@ -137,10 +187,31 @@
         limit.placeholder = word("Minimum remaining; empty disables this rule"); limit.setAttribute("aria-label", `${m.label || m.id}: ${limit.placeholder}`);
         limit.disabled = !!k.busy;
         limit.oninput = () => {
+          const refreshWithin = policy.rules.find(r => r.metric === m.id)?.refreshWithin || k.nearRanges.get(m.id) || "";
           policy.rules = policy.rules.filter(r => r.metric !== m.id);
-          if (limit.value.trim() !== "") policy.rules.push({ metric: m.id, unit: m.unit, minimum: limit.value.trim() });
+          if (limit.value.trim() !== "") policy.rules.push({
+            metric: m.id, unit: m.unit, minimum: limit.value.trim(),
+            ...(refreshWithin ? { refreshWithin } : {}),
+          });
         };
         label.append(limit); row.append(label);
+        const nearValue = r?.refreshWithin || k.nearRanges.get(m.id) || "";
+        if (refreshMode.value === "near" || nearValue) {
+          const nearText = refreshMode.value === "near" ? "Refresh within this distance above reserve" : "Saved near range (used only in near-reserve mode)";
+          const nearLabel = node("label", "quota-near-range", word(nearText));
+          const near = node("input", "words"); near.inputMode = "decimal"; near.value = nearValue;
+          near.placeholder = word("Same unit as this metric"); near.disabled = !!k.busy;
+          near.setAttribute("aria-label", String(m.label || m.id) + ": " + word("Refresh within this distance above reserve"));
+          near.oninput = () => {
+            const value = near.value.trim();
+            if (value) k.nearRanges.set(m.id, value); else k.nearRanges.delete(m.id);
+            const currentRule = policy.rules.find(rule => rule.metric === m.id);
+            if (!currentRule) return;
+            currentRule.refreshWithin = value;
+            if (!currentRule.refreshWithin) delete currentRule.refreshWithin;
+          };
+          nearLabel.append(near); row.append(nearLabel);
+        }
         row.append(node("div", "hint", m.remaining === undefined ? word("No valid reading") : `${m.remaining} ${m.unit} · ${m.scope || ""} · ${new Date(m.at).toLocaleString()}`));
         form.append(row);
       }
@@ -154,7 +225,7 @@
       const actions = node("div", "quota-actions");
       const reload = button("Reload protection state", async () => {
         if (!same(k.policy, k.saved) && !await confirmAction(word("Discard"), word("Discard unsaved quota changes?"), word("Discard"))) return;
-        if (!current()) return; k.view = null; k.policy = null; k.snapshots = null; k.error = ""; draw(); load();
+        if (!current()) return; k.view = null; k.policy = null; k.snapshots = null; k.nearRanges.clear(); k.error = ""; draw(); load();
       });
       const refresh = button(metrics.size ? "Refresh upstream quota" : "Read upstream quota", () => perform("refresh", { policy: copy(policy) }));
       const save = button("Save quota protection", () => perform("configure", { policy: copy(policy) }));

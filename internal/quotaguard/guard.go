@@ -19,21 +19,29 @@ const (
 	MaxOverride   = 24 * time.Hour
 )
 
+const (
+	RefreshModeCached       = "cached"
+	RefreshModeNearReserve  = "near"
+	RefreshModeEveryAttempt = "everyAttempt"
+)
+
 var ErrConflict = errors.New("quota guard changed; reload before applying this action")
 
 // Rule names a reported metric, not a vendor or a synthetic local budget.
 // Minimum is decimal text so a money boundary is not rounded through a float.
 // A reading equal to Minimum trips as well: reserve 20 means stop at 20 left.
 type Rule struct {
-	Metric  string `json:"metric"`
-	Unit    string `json:"unit"`
-	Minimum string `json:"minimum"`
+	Metric        string `json:"metric"`
+	Unit          string `json:"unit"`
+	Minimum       string `json:"minimum"`
+	RefreshWithin string `json:"refreshWithin,omitempty"`
 }
 
 type Policy struct {
 	Enabled       bool   `json:"enabled"`
 	Rules         []Rule `json:"rules"`
 	MaxAgeSeconds int    `json:"maxAgeSeconds,omitempty"`
+	RefreshMode   string `json:"refreshMode,omitempty"`
 	// A custom balance uses the provider's EXISTING Balance URL and auth.
 	// The explicit raw JSON pointer is a numeric field, not BalancePath's
 	// formatted text/expression. No new destination or script is introduced.
@@ -67,6 +75,11 @@ func (p Policy) Validate() error {
 	if p.MaxAgeSeconds != 0 && (p.MaxAgeSeconds < 5 || p.MaxAgeSeconds > 600) {
 		return errors.New("quota observation age must be 5 to 600 seconds")
 	}
+	switch p.RefreshMode {
+	case "", RefreshModeCached, RefreshModeNearReserve, RefreshModeEveryAttempt:
+	default:
+		return errors.New("unknown quota refresh mode")
+	}
 	if p.Enabled && len(p.Rules) == 0 {
 		return errors.New("an enabled quota guard needs a rule")
 	}
@@ -74,6 +87,7 @@ func (p Policy) Validate() error {
 		return errors.New("at most 32 quota rules per credential")
 	}
 	seen := map[string]bool{}
+	hasNearBand := false
 	for _, r := range p.Rules {
 		if r.Metric == "" || len(r.Metric) > 256 || r.Unit == "" || len(r.Unit) > 32 {
 			return errors.New("a quota rule needs a metric and its unit")
@@ -89,6 +103,16 @@ func (p Policy) Validate() error {
 		if r.Unit == "percent" && n.Cmp(big.NewRat(100, 1)) > 0 {
 			return errors.New("a percentage reserve must not exceed 100")
 		}
+		if r.RefreshWithin != "" {
+			near, err := Number(r.RefreshWithin)
+			if err != nil || near.Sign() <= 0 {
+				return errors.New("a near-reserve refresh range must be a positive decimal in the rule's unit")
+			}
+			hasNearBand = true
+		}
+	}
+	if p.Enabled && p.RefreshMode == RefreshModeNearReserve && !hasNearBand {
+		return errors.New("near-reserve refresh needs a positive range on at least one rule")
 	}
 	if p.BalancePointer != "" {
 		if !strings.HasPrefix(p.BalancePointer, "/") || len(p.BalancePointer) > 512 || p.BalanceUnit == "" || len(p.BalanceUnit) > 32 {
@@ -151,6 +175,7 @@ type Decision struct {
 	GuardEnabled   bool       `json:"guardEnabled"`
 	Protected      bool       `json:"protected"`
 	Unknown        bool       `json:"unknown"`
+	NearReserve    bool       `json:"nearReserve,omitempty"`
 	OverrideActive bool       `json:"overrideActive"`
 	OverrideUntil  *time.Time `json:"overrideUntil,omitempty"`
 	Reasons        []Reason   `json:"reasons,omitempty"`
@@ -216,6 +241,12 @@ func Assess(e Entry, manualEnabled bool, now time.Time) Decision {
 		if value.Cmp(minimum) <= 0 {
 			d.Protected = true
 			d.Reasons = append(d.Reasons, Reason{Metric: rule.Metric, Code: "reserve_reached", Remaining: metric.Remaining, Minimum: rule.Minimum, Unit: rule.Unit})
+		}
+		if e.Policy.RefreshMode == RefreshModeNearReserve && rule.RefreshWithin != "" {
+			near, _ := Number(rule.RefreshWithin) // Policy.Validate checked it above.
+			if value.Cmp(new(big.Rat).Add(minimum, near)) <= 0 {
+				d.NearReserve = true
+			}
 		}
 	}
 	if d.Protected && len(d.Reasons) == 0 {

@@ -55,6 +55,9 @@ plugins' scripts and `app.js`, all classic scripts sharing one scope. It is
   `show` opens it (a promise it gives back puts the reader back where they
   were once it settles), `relang` when the language changes on it.
   `title` is the page's header (English; `show` translates it).
+  Optional `navigationTabs()` derives `{id, title, run}` targets from the page's
+  own tab directory for quick navigation before it renders. Its `run` uses the
+  page's existing tab-selection path; it must not activate settings actions.
   `magpie.pages()` adds the plugins' pages to the views `show` and
   `?view=` know.
 - **Words.** A plugin's `i18n.js` calls `magpie.strings({zh, "zh-TW", ja,

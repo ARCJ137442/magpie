@@ -703,4 +703,6 @@ saves, narrow layouts and all five languages in Chromium and WebKit.
 
 ## Object and field settings navigation
 
-See [settings-navigation](settings-navigation.md) for the opt-in behavior, boundaries and verification requirements.
+The title bar's magnifier and configurable Ctrl/Cmd+K open quick navigation.
+Its matcher and catalog load on first use. See [settings-navigation](settings-navigation.md)
+for discovery sources, local preferences, interaction boundaries and verification.

@@ -6776,6 +6776,7 @@ function segs(items, current, onPick) {
   let key = kind + "#" + ++segsMade;
   for (const [id, name] of items) {
     const b = el("button", "opt" + (id === current ? " on" : ""), name);
+    b.dataset.navKey = String(id);
     b.type = "button";
     b.setAttribute("aria-pressed", String(id === current));
     b.onclick = () => {
@@ -24116,11 +24117,12 @@ if (mode === "window") {
       body.classList.remove("tools-tight");
       set("--crumb-max", "none");
       set("--tools-l", Math.ceil(c.left + whole + 16) + "px");
-      if (!head || !over().over) return;
+      // An empty tools head still needs room beside the title and actions.
+      if (!head || (!over().over && c.left + whole + 17 <= a.left - 8)) return;
       body.classList.add("tools-tight");
       const o = over();
-      if (!o.over) return;
-      const max = Math.max(0, Math.floor(a.left - 8 - 16 - o.need - c.left));
+      if (!o.over && c.left + whole + 17 <= a.left - 8) return;
+      const max = Math.max(0, Math.floor(a.left - 8 - 16 - Math.max(1, o.need) - c.left));
       // where the reader is keeps its last word: "Work / Library /" goes,
       // a part and its slash at a time, before "MCP servers" is cut
       let w = whole;

@@ -2382,20 +2382,24 @@ let sessTopOpen = ""; // the top session opened to its details
 let sessListOpen = ""; // with the Sessions page switched off, the listed session opened here to its details (#2311)
 const sessFull = new Map(); // a top session's key → the session read whole, or "…" while it is read
 
+function selectUsageTab(id) {
+  if (!USAGE_TABS.some(([key]) => key === id)) return false;
+  if (id === usageTab) return true;
+  if (usageTab === "requests") ledLeave();
+  usageTab = id;
+  try { localStorage.setItem("magpie.usageTab", id); } catch {}
+  $("#usageCost").replaceChildren();
+  // The tab strip and quick navigation take the same path back to allowances.
+  loadUsage(id === "usage").catch((e) => status(e.message, "err"));
+  return true;
+}
 function renderUsageTab() {
   const seg = $("#usageTab");
   seg.replaceChildren();
   for (const [id, name] of USAGE_TABS) {
     const b = el("button", "opt" + (id === usageTab ? " on" : ""), t(name));
-    b.onclick = () => {
-      if (id === usageTab) return;
-      if (usageTab === "requests") ledLeave();
-      usageTab = id;
-      try { localStorage.setItem("magpie.usageTab", id); } catch {}
-      $("#usageCost").replaceChildren();
-      // to the Overview is to the allowances (#1588)
-      loadUsage(id === "usage").catch((e) => status(e.message, "err"));
-    };
+    b.dataset.navKey = id;
+    b.onclick = () => selectUsageTab(id);
     seg.append(b);
   }
   slide(seg, "usageTab");

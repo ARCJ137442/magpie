@@ -35,6 +35,8 @@ async function open(t, engine, lang, width = 900) {
       if (url.pathname === "/api/state") return json({ agents: [], profiles: [], settings: { lang, theme } });
       if (url.pathname === "/api/providers") return json(providers);
       if (url.pathname === "/api/groups") return json({ groups: [] });
+      if (url.pathname === "/api/usage/quotas" || url.pathname === "/api/usage/quotas/history") return json([]);
+      if (url.pathname === "/api/usage") return json({ calls: 0, input: 0, output: 0, series: [], agents: [], models: [] });
       return json({});
     }
     const file = path.join(assets, url.pathname === "/" ? "index.html" : url.pathname);
@@ -49,8 +51,8 @@ async function open(t, engine, lang, width = 900) {
 }
 
 async function find(page, query) {
-  await page.keyboard.press("Control+Shift+P");
-  const search = page.locator(".settings-command input");
+  await page.keyboard.press("Control+k");
+  const search = page.locator(".settings-command input.words");
   await search.fill(query);
   await page.locator(".settings-command-result").first().waitFor();
   return search;
@@ -58,6 +60,35 @@ async function find(page, query) {
 
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
   for (const lang of ["en", "zh", "zh-TW", "ja", "de"]) {
+    test(`${engine} ${lang}: centered quick navigation, fuzzy names, outside cancel and recent numeric selection`, async t => {
+      const { page, errors, writes } = await open(t, engine, lang, 1200);
+      assert.equal(await page.evaluate(() => typeof window.MagpieNavigationCore), "undefined", "search is not part of startup");
+      const search = await find(page, "MiniMax 直连 排队");
+      assert.equal(await page.locator(".settings-command-result").count(), 2);
+      const rect = await page.locator(".settings-command").boundingBox();
+      assert.ok(Math.abs(rect.x + rect.width / 2 - 600) < 2, "palette is horizontally centered");
+      assert.ok(rect.y >= 16 && rect.y < 120, "palette sits below the title bar");
+      assert.equal(await page.locator(".settings-command button").filter({ hasText: /^(Close|关闭)$/ }).count(), 0);
+      if (process.env.ARTIFACT_DIR) {
+        await fs.mkdir(process.env.ARTIFACT_DIR, { recursive: true });
+        await page.screenshot({ path: path.join(process.env.ARTIFACT_DIR, `${engine}-${lang}-quick-navigation.png`) });
+      }
+      await page.mouse.click(1195, 755);
+      assert.equal(await page.locator(".settings-command").count(), 0, "outside click cancels");
+      const again = await find(page, 'object:"MiniMax 直连" "queue wait"');
+      assert.equal(await page.locator(".settings-command-result").count(), 1);
+      await again.press("Control+1");
+      await page.locator("#modal .editor input.queue-wait").waitFor({ state: "visible" });
+      assert.equal(await page.evaluate(() => editing), "direct");
+      await page.keyboard.press("Control+k");
+      await page.locator(".settings-command").waitFor();
+      assert.equal(await page.locator(".settings-command-result").first().getAttribute("data-target"), "provider:direct:queueWait");
+      await page.locator(".settings-command input.words").fill("?");
+      assert.equal(await page.locator(".settings-command-help").isVisible(), true);
+      assert.deepEqual(writes, []);
+      assert.deepEqual(errors, []);
+    });
+
     test(`${engine} ${lang}: exact provider field navigation is read only and preserves a draft`, async t => {
       const { page, errors, writes } = await open(t, engine, lang);
       await page.evaluate(() => show("agents"));
@@ -88,7 +119,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const initial = editor.locator("input").first();
       await initial.focus();
       await initial.press("Control+f");
-      const search = page.locator(".settings-command input");
+      const search = page.locator(".settings-command input.words");
       await search.waitFor({ state: "visible" });
       assert.ok(await page.locator(".settings-command-result").count(), "the current editor has field descriptors");
       const colors = await page.locator(".settings-command").evaluate(e => ({
@@ -125,6 +156,44 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await confirm.getByRole("button", { name: cancel, exact: true }).click();
       assert.equal(await page.evaluate(() => editing), "shared");
       assert.equal(await page.locator(".editor input.price-rate").inputValue(), "1.5");
+      assert.deepEqual(writes, []);
+      assert.deepEqual(errors, []);
+    });
+  }
+  for (const lang of ["en", "zh"]) {
+    test(`${engine} ${lang}: tab discovery and navigation preferences survive reload`, async t => {
+      const { page, errors, writes } = await open(t, engine, lang, 560);
+      const search = await find(page, 'page:usage "Overview"');
+      await search.press("Enter");
+      await page.waitForFunction(() => view === "usage" && usageTab === "usage");
+      assert.equal(await page.locator("#usagePane").isVisible(), true);
+      await page.evaluate(() => {
+        const button = document.createElement("button"); button.dataset.view = "fixture-page";
+        const name = document.createElement("span"); name.textContent = "New fixture page"; button.append(name);
+        document.querySelector("#nav").append(button);
+        magpie.plugin("fixture-page", ctx => ctx.slots.add("page", { key: "fixture-page", title: "New fixture page" }));
+      });
+      const next = await find(page, '"New fixture page"');
+      assert.equal(await page.locator(".settings-command-result[data-target='page:fixture-page']").count(), 1, "new page needs no navigation list edit");
+      await next.fill("");
+      await page.locator(".settings-command-config").click();
+      await page.locator(".nav-rows").fill("4");
+      await page.locator(".nav-rows").press("Tab");
+      assert.equal(await page.evaluate(() => magpieNavigationPrefs.get().rows), 4);
+      await page.locator(".nav-shortcut").click();
+      await page.locator(".nav-shortcut").press("Control+Alt+j");
+      assert.equal(await page.evaluate(() => magpieNavigationPrefs.get().shortcut), "Ctrl+Alt+J");
+      await page.keyboard.press("Escape");
+      await page.keyboard.press("Control+k");
+      assert.equal(await page.locator(".settings-command").count(), 0, "old binding is released");
+      await page.keyboard.press("Control+Alt+j");
+      await page.locator(".settings-command").waitFor();
+      await page.keyboard.press("Escape");
+      await page.reload();
+      await page.locator(".settings-command-open").waitFor();
+      await page.keyboard.press("Control+Alt+j");
+      await page.locator(".settings-command").waitFor();
+      assert.equal(await page.evaluate(() => magpieNavigationPrefs.get().rows), 4);
       assert.deepEqual(writes, []);
       assert.deepEqual(errors, []);
     });

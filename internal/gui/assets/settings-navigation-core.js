@@ -1,5 +1,5 @@
 // Local descriptor search. No model call, telemetry, input-value indexing or
-// fuzzy selection that silently edits a setting. Exported for isolated tests.
+// automatic setting changes. Exported for isolated tests.
 (function(root, factory) {
   const core = factory();
   if (typeof module === "object" && module.exports) module.exports = core;
@@ -14,20 +14,67 @@
     ["每分钟请求", "requests per minute"], ["余额", "balance"], ["请求头", "headers"],
   ];
   function normalize(value) {
-    let s = String(value || "").normalize("NFKC").toLocaleLowerCase();
-    for (const [from,to] of aliases) s = s.split(from).join(to);
-    return s.replace(/[的:：\/·>›]+/g," ").replace(/\s+/g," ").trim();
+    return String(value || "").normalize("NFKC").toLowerCase()
+      .replace(/[的:：\/·>›]+/g," ").replace(/\s+/g," ").trim();
   }
   function words(query) {return [...new Set(normalize(query).split(" ").filter(Boolean))];}
-  function score(entry, query) {
-    const terms = words(query), title = normalize(entry.title), object = normalize(entry.object);
-    const text = normalize([entry.title,entry.object,entry.path,...(entry.keywords || [])].join(" "));
-    if (!terms.every(term => text.includes(term))) return -1;
-    let n = 0;
-    for (const term of terms) n += object === term ? 12 : title === term ? 10 : title.includes(term) ? 5 : object.includes(term) ? 4 : 1;
-    if (normalize(query) === normalize([entry.object,entry.title].filter(Boolean).join(" "))) n += 100;
-    return n;
+  function variants(value) {
+    const text = normalize(value), result = [text];
+    for (const [from, to] of aliases) {
+      if (text.includes(from)) result.push(to);
+      if (text.includes(to)) result.push(from);
+    }
+    return result;
   }
+  // Quotes are exact phrases, spaces AND, | OR, ! excludes. These fields
+  // describe navigation targets; no query is evaluated as code or sent away.
+  function parse(query) {
+    const groups = [[]];
+    for (let token of String(query).match(/(?:[^\s"|]|"[^"]*")+|\|/g) || []) {
+      if (token === "|") { if (groups.at(-1).length) groups.push([]); continue; }
+      const exclude = token.startsWith("!");
+      if (exclude) token = token.slice(1);
+      const field = /^(page|object|type):/i.exec(token);
+      if (field) token = token.slice(field[0].length);
+      const exact = token.startsWith('"') && token.endsWith('"');
+      const text = normalize(exact ? token.slice(1, -1) : token);
+      if (text) groups.at(-1).push({ field: field?.[1].toLowerCase() || "", text, exact, exclude });
+    }
+    return groups.filter(group => group.length);
+  }
+  function match(text, term) {
+    if (text === term.text) return 100;
+    if (text.startsWith(term.text)) return 80;
+    if (text.includes(term.text)) return 60;
+    if (term.exact || !/^[a-z0-9_-]{2,}$/i.test(term.text)) return -1;
+    let at = 0, first = -1, last = -1;
+    for (const ch of term.text) {
+      at = text.indexOf(ch, at);
+      if (at < 0) return -1;
+      if (first < 0) first = at;
+      last = at++;
+    }
+    return 20 + term.text.length / (last - first + 1);
+  }
+  function rank(entry, groups) {
+    if (!groups.length) return 0;
+    const fields = {
+      page: variants([entry.page || entry.path, entry.pageId].filter(Boolean).join(" ")), object: variants(entry.object), type: [normalize(entry.type)],
+      "": [entry.title, entry.object, entry.path, ...(entry.keywords || [])].flatMap(variants),
+    };
+    let best = -1;
+    for (const group of groups) {
+      let sum = 0, valid = true;
+      for (const term of group) {
+        const n = Math.max(...fields[term.field].map(value => match(value, term)));
+        if (term.exclude ? n >= 0 : n < 0) { valid = false; break; }
+        if (!term.exclude) sum += n;
+      }
+      if (valid) best = Math.max(best, sum);
+    }
+    return best;
+  }
+  function score(entry, query) { return rank(entry, parse(query)); }
   class Registry {
     constructor() {this.groups = new Map();}
     replace(group, entries) {
@@ -44,9 +91,10 @@
       for (const es of this.groups.values()) for (const e of es) unique.set(e.id,e);
       return [...unique.values()];
     }
-    search(query, scope, limit = 60) {
-      return this.entries().filter(e => !scope || e.scope === scope).map(e => ({entry:e,rank:score(e,query)}))
-        .filter(x => x.rank >= 0).sort((a,b) => b.rank-a.rank || a.entry.id.localeCompare(b.entry.id))
+    search(query, scope, limit = 200, recent = []) {
+      const groups = parse(query), history = new Map(recent.map((id, i) => [id, recent.length - i]));
+      return this.entries().filter(e => !scope || e.scope === scope).map(e => ({entry:e,rank:rank(e,groups),recent:history.get(e.id)||0}))
+        .filter(x => x.rank >= 0).sort((a,b) => b.rank-a.rank || b.recent-a.recent || a.entry.id.localeCompare(b.entry.id))
         .slice(0,limit).map(x => x.entry);
     }
   }
@@ -63,13 +111,13 @@
     const result=[];
     for (const p of providers || []) {
       const object = p.name || p.id;
-      result.push({id:`provider:${p.id}`,scope:"global",title:object,object:p.id,path:translate("Providers"),keywords:["提供商","provider"],run:e=>reveal(p.id,null,e)});
+      result.push({id:`provider:${p.id}`,scope:"global",type:"object",pageId:"providers",page:translate("Providers"),title:object,object:p.id,path:translate("Providers"),keywords:["提供商","provider"],run:e=>reveal(p.id,null,e)});
       if (p.account) continue; // subscription editors do not expose these same fields
-      for (const f of providerFields) result.push({id:`provider:${p.id}:${f.id}`,scope:"global",title:translate(f.title),object,
-        path:`${translate("Providers")} › ${object} › ${translate("Advanced")} › ${translate(f.title)}`,
+      for (const f of providerFields) result.push({id:`provider:${p.id}:${f.id}`,scope:"global",type:"input",pageId:"providers",page:translate("Providers"),title:translate(f.title),object,
+        path:`${translate("Providers")} › ${object} › ${translate("Advanced")}`,
         keywords:[p.id,f.title,...f.keywords],run:e=>reveal(p.id,f,e)});
     }
     return result;
   }
-  return {normalize,words,score,Registry,providerFields,providerDescriptors};
+  return {normalize,words,parse,score,Registry,providerFields,providerDescriptors};
 });

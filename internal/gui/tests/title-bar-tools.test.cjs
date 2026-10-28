@@ -95,7 +95,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         // WebKit reports each one as a page error, "Fetch API cannot load …
         // due to access control checks" (#1350, #1307): not this test's
         page.on("pageerror", (e) => {
-          if (engine === "webkit" && /^Fetch API cannot load .* due to access control checks/.test(e.message)) return;
+          // WebKit can shorten message to the URL's tail; stack retains the
+          // full first line identifying the same canceled navigation request.
+          if (engine === "webkit" && /^Fetch API cannot load .* due to access control checks/.test(e.stack || e.message)) return;
           errors.push(`${width}px ${on}: ${e.stack}`);
         });
         await page.route("**/*", serve(lang));

@@ -232,6 +232,7 @@ func checkQuotaGuard(ctx context.Context, p Provider, beforeAttempt bool) error 
 	d := quotaguard.Assess(e, true, time.Now())
 	_, readHere := guardReadThisProcess.Load(guardReadID(p, id, e.Revision))
 	forceFresh := false
+	forceAutoRearm := d.Protected && e.Policy.AutoRearm != nil && e.Policy.AutoRearm.Enabled
 	if beforeAttempt && d.Allowed {
 		switch e.Policy.RefreshMode {
 		case quotaguard.RefreshModeNearReserve:
@@ -244,9 +245,12 @@ func checkQuotaGuard(ctx context.Context, p Provider, beforeAttempt bool) error 
 	// a credential. Near/strict modes defer a fresh read to the physical-send
 	// gate unless the stored observation is unknown or stale; this avoids
 	// fetching twice merely because routing planned the request.
-	needRead := d.Unknown || (!readHere && e.Policy.RefreshMode == quotaguard.RefreshModeCached) || forceFresh
+	needRead := d.Unknown || (!readHere && e.Policy.RefreshMode == quotaguard.RefreshModeCached) || forceFresh || forceAutoRearm
 	if needRead {
-		if err = refreshQuotaGuardOnce(ctx, p, id, forceFresh); err != nil {
+		// A latched auto-rearm guard must be allowed to observe recovery even
+		// though admission is currently denied. Its five-second in-flight/
+		// recent-read coalescing bounds the vendor read rate.
+		if err = refreshQuotaGuardOnce(ctx, p, id, forceFresh && !forceAutoRearm); err != nil {
 			return guardUnavailable()
 		}
 		_, e, err = quotaGuardEntry(p)

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/yetone/magpie/internal/quotaguard"
@@ -82,5 +84,60 @@ func TestGuardOldProviderCannotRefreshChangedSource(t *testing.T) {
 	}
 	if view.Decision.Allowed {
 		t.Fatal("the previous balance source authorized the changed source")
+	}
+}
+
+func TestGuardAutoRearmReadsWhileProtected(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	var balanceCalls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/balance") {
+			http.NotFound(w, r)
+			return
+		}
+		n := balanceCalls.Add(1)
+		left := "9.99"
+		if n > 1 {
+			left = "50"
+		}
+		fmt.Fprintf(w, `{"data":{"balance":%q}}`, left)
+	}))
+	t.Cleanup(srv.Close)
+
+	p := Provider{ID: "guard-auto", Key: "fixture-only", Chat: srv.URL + "/v1", BalanceURL: srv.URL + "/balance", BalancePath: "$data.balance"}
+	if err := Save(p); err != nil {
+		t.Fatal(err)
+	}
+	policy := quotaguard.Policy{
+		Enabled:        true,
+		RefreshMode:    quotaguard.RefreshModeEveryAttempt,
+		Rules:          []quotaguard.Rule{{Metric: "balance:custom", Unit: "CNY", Minimum: "10"}},
+		BalancePointer: "/data/balance",
+		BalanceUnit:    "CNY",
+		AutoRearm:      &quotaguard.AutoRearm{Enabled: true, Consecutive: 2, HeadroomPercent: 10, MaxAgeSeconds: 60},
+	}
+	if _, err := ConfigureQuotaGuard(p, policy, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RefreshQuotaGuard(context.Background(), p, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := AdmitQuotaAttempt(context.Background(), p); err == nil {
+		t.Fatal("a tripped guard admitted the first recovery read")
+	}
+	_, entry, err := quotaGuardEntry(p)
+	if err != nil || !entry.Protection.Tripped || entry.Protection.RecoveryCount != 1 {
+		t.Fatalf("first recovery read: %+v %v", entry.Protection, err)
+	}
+
+	quotaGuardRefresh.Lock()
+	quotaGuardRefresh.calls = nil
+	quotaGuardRefresh.Unlock()
+	if err := AdmitQuotaAttempt(context.Background(), p); err != nil {
+		t.Fatal("second recovery read did not re-arm:", err)
+	}
+	_, entry, err = quotaGuardEntry(p)
+	if err != nil || entry.Protection.Tripped || entry.Protection.LastAction != "auto-rearm" || balanceCalls.Load() != 3 {
+		t.Fatalf("auto-rearm: %+v calls=%d %v", entry.Protection, balanceCalls.Load(), err)
 	}
 }

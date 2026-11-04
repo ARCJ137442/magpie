@@ -113,3 +113,50 @@ func TestUnusedStoreReadHasNoSideEffects(t *testing.T) {
 		t.Fatal("disabled feature created a directory")
 	}
 }
+
+func TestAutoRearmPersistsConsecutiveObservations(t *testing.T) {
+	s := Store{Path: filepath.Join(t.TempDir(), "quota-guards.json")}
+	now := time.Now()
+	p := fixture(now, "10").Policy
+	p.AutoRearm = &AutoRearm{Enabled: true, Consecutive: 2, HeadroomPercent: 10, MaxAgeSeconds: 60}
+	e, err := s.Configure("provider/key/fake", p, 0, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	low := fixture(now.Add(time.Second), "10").Snapshots["windows"]
+	if err = s.Observe("provider/key/fake", e.Revision, low, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	e, err = s.Get("provider/key/fake")
+	if err != nil || !e.Protection.Tripped {
+		t.Fatalf("trip: %+v %v", e.Protection, err)
+	}
+
+	first := fixture(now.Add(2*time.Second), "90").Snapshots["windows"]
+	if err = s.Observe("provider/key/fake", e.Revision, first, now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	fresh := Store{Path: s.Path}
+	e, err = fresh.Get("provider/key/fake")
+	if err != nil || !e.Protection.Tripped || e.Protection.RecoveryCount != 1 {
+		t.Fatalf("first reading: %+v %v", e.Protection, err)
+	}
+
+	late := fixture(now.Add(1500*time.Millisecond), "95").Snapshots["windows"]
+	if err = fresh.Observe("provider/key/fake", e.Revision, late, now.Add(3*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	e, err = fresh.Get("provider/key/fake")
+	if err != nil || e.Protection.RecoveryCount != 1 || e.Snapshots["windows"].Metrics[0].Remaining != "90" {
+		t.Fatalf("late observation changed recovery: %+v %v", e, err)
+	}
+
+	second := fixture(now.Add(3*time.Second), "90").Snapshots["windows"]
+	if err = fresh.Observe("provider/key/fake", e.Revision, second, now.Add(3*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	e, err = fresh.Get("provider/key/fake")
+	if err != nil || e.Protection.Tripped || e.Protection.LastAction != "auto-rearm" || e.Protection.LastAutoRearm == nil {
+		t.Fatalf("auto-rearm: %+v %v", e.Protection, err)
+	}
+}

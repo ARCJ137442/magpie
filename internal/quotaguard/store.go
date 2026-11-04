@@ -116,7 +116,8 @@ func (s Store) Get(subject string) (Entry, error) {
 }
 
 // Configure is explicit user intent. Changing a rule re-evaluates the current
-// observation, but an ordinary background refresh never clears an earlier trip.
+// observation; a background refresh clears an earlier trip only through the
+// policy's opt-in auto-rearm confirmation.
 func (s Store) Configure(subject string, p Policy, expected uint64, now time.Time) (Entry, error) {
 	var out Entry
 	if subject == "" || len(subject) > 512 {
@@ -170,6 +171,7 @@ func (s Store) Observe(subject string, revision uint64, snap Snapshot, now time.
 		}
 		e.Snapshots[snap.Source] = snap
 		Latch(&e, now)
+		noteAutoRearm(&e, snap, now)
 		d.Entries[subject] = e
 		return true, nil
 	})

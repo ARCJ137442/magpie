@@ -3,7 +3,8 @@
   "use strict";
   const sessions = new Map();
   const copy = (x) => JSON.parse(JSON.stringify(x));
-  const blank = () => ({ enabled: false, rules: [], maxAgeSeconds: 60, refreshMode: "cached" });
+  const autoBlank = (maxAge = 60) => ({ enabled: false, consecutive: 2, headroomPercent: 10, maxAgeSeconds: maxAge });
+  const blank = () => ({ enabled: false, rules: [], maxAgeSeconds: 60, refreshMode: "cached", autoRearm: autoBlank() });
   const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
   const word = (s, args) => t(s, args);
   function node(tag, cls, text) {
@@ -78,6 +79,7 @@
       k.view = v;
       if (replacePolicy || !k.policy) { const policy = v.entry.policy || {};
         k.saved = { ...blank(), ...copy(policy), rules: Array.isArray(policy.rules) ? copy(policy.rules) : [] };
+        k.saved.autoRearm = { ...autoBlank(k.saved.maxAgeSeconds || 60), ...(policy.autoRearm || {}) };
         k.policy = copy(k.saved); }
     }
     async function load() {
@@ -104,6 +106,25 @@
         const hasRange = nearRules.some((r) => validNearRange(r.refreshWithin));
         if (!hasRange) {
           k.error = word("Near-reserve mode needs a positive range on at least one rule");
+          draw(); return;
+        }
+      }
+      const auto = extra.policy?.autoRearm;
+      if (action === "configure" && auto?.enabled) {
+        const consecutive = Number(auto.consecutive);
+        if (!Number.isInteger(consecutive) || consecutive < 2 || consecutive > 10) {
+          k.error = word("Consecutive readings must be between 2 and 10");
+          draw(); return;
+        }
+        const headroom = Number(auto.headroomPercent);
+        if (!Number.isInteger(headroom) || headroom < 1 || headroom > 100) {
+          k.error = word("Recovery headroom must be between 1 and 100 percent");
+          draw(); return;
+        }
+        const autoAge = Number(auto.maxAgeSeconds);
+        const policyAge = Number(extra.policy.maxAgeSeconds || 60);
+        if (!Number.isInteger(autoAge) || autoAge < 5 || autoAge > 600 || autoAge > policyAge) {
+          k.error = word("Auto-rearm reading age must be between 5 and 600 seconds and no longer than the policy reading age");
           draw(); return;
         }
       }
@@ -135,12 +156,17 @@
         return;
       }
       const policy = k.policy, d = k.view.decision;
+      const auto = policy.autoRearm || autoBlank(Number(policy.maxAgeSeconds) || 60);
+      if (!policy.autoRearm) policy.autoRearm = auto;
       const facts = [];
       if (d.manualOff) facts.push(word("Manually disabled"));
       if (d.protected) facts.push(word("Reserve protection latched"));
       if (d.unknown) facts.push(word("Quota unknown"));
       if (d.nearReserve && policy.refreshMode === "near") facts.push(word("Near reserve; refreshing every attempt"));
       if (d.overrideActive) facts.push(word("Override until {time}", { time: new Date(d.overrideUntil).toLocaleString() }));
+      const lastAuto = k.view.entry?.protection?.lastAutoRearm;
+      if (lastAuto?.at) facts.push(word("Automatically re-armed {time}", { time: new Date(lastAuto.at).toLocaleString() }));
+      if (d.protected && auto.enabled) facts.push(word("Recovery confirmations: {count}/{needed}", { count: Number(k.view.entry?.protection?.recoveryCount || 0), needed: auto.consecutive || 2 }));
       if (!facts.length) facts.push(word(d.guardEnabled ? "Protection armed" : "Protection not enabled"));
       const state = node("p", "hint quota-status", facts.join(" · ")); state.setAttribute("role", "status"); form.append(state);
       const enabled = node("input"); enabled.type = "checkbox"; enabled.checked = !!policy.enabled; enabled.disabled = !!k.busy;
@@ -166,7 +192,12 @@
         const n = Number(age.value);
         if (!Number.isInteger(n) || n < 5 || n > 600) {
           k.ageInvalid = true;
-        } else { policy.maxAgeSeconds = n; k.ageInvalid = false; k.error = ""; }
+        } else {
+          policy.maxAgeSeconds = n;
+          if (policy.autoRearm?.enabled && policy.autoRearm.maxAgeSeconds > n) policy.autoRearm.maxAgeSeconds = n;
+          k.ageInvalid = false;
+          k.error = "";
+        }
       };
       ageLabel.append(age); refreshSettings.append(ageLabel);
       const modeHint = {
@@ -175,20 +206,53 @@
         everyAttempt: "Every-attempt refresh adds latency and upstream quota reads",
       };
       refreshSettings.append(node("p", "hint", word(modeHint[refreshMode.value]))); form.append(refreshSettings);
+      const autoSettings = node("div", "quota-refresh-settings quota-auto-settings");
+      const autoToggle = node("input"); autoToggle.type = "checkbox"; autoToggle.checked = !!auto.enabled; autoToggle.disabled = !!k.busy;
+      const autoToggleLabel = node("label", "quota-toggle");
+      autoToggleLabel.append(autoToggle, document.createTextNode(word("Automatically re-arm after confirmed recovery")));
+      autoToggle.onchange = () => {
+        auto.enabled = autoToggle.checked;
+        if (auto.enabled) {
+          const policyAge = Number(policy.maxAgeSeconds || 60);
+          if (!Number.isInteger(Number(auto.consecutive)) || Number(auto.consecutive) < 2 || Number(auto.consecutive) > 10) auto.consecutive = 2;
+          if (!Number.isInteger(Number(auto.headroomPercent)) || Number(auto.headroomPercent) < 1 || Number(auto.headroomPercent) > 100) auto.headroomPercent = 10;
+          if (!Number.isInteger(Number(auto.maxAgeSeconds)) || Number(auto.maxAgeSeconds) < 5 || Number(auto.maxAgeSeconds) > policyAge) auto.maxAgeSeconds = policyAge;
+        }
+        draw();
+      };
+      autoSettings.append(autoToggleLabel);
+      if (auto.enabled) {
+        const addAutoNumber = (label, key, min, max) => {
+          const field = node("label", "", word(label));
+          const input = node("input", "words"); input.type = "number"; input.min = String(min); input.max = String(max); input.step = "1";
+          input.value = String(auto[key] ?? min); input.disabled = !!k.busy;
+          input.oninput = () => { auto[key] = Number(input.value); };
+          field.append(input); autoSettings.append(field);
+        };
+        addAutoNumber("Consecutive recovered readings", "consecutive", 2, 10);
+        addAutoNumber("Recovery headroom (% of reserve)", "headroomPercent", 1, 100);
+        addAutoNumber("Auto-rearm reading age (seconds)", "maxAgeSeconds", 5, Math.min(600, Number(policy.maxAgeSeconds || 60)));
+      }
+      autoSettings.append(node("p", "hint", word(auto.enabled
+        ? "Automatic re-arm needs fresh readings above reserve plus headroom; unknown or stale readings keep protection latched."
+        : "Automatic re-arm is off; recovery stays latched until a person re-arms it.")));
+      form.append(autoSettings);
       const snapshots = k.snapshots || Object.values(k.view.entry.snapshots || {});
       const metrics = new Map();
       for (const snap of snapshots) for (const m of snap.metrics || []) metrics.set(m.id, { ...m, at: snap.observedAt });
-      for (const r of policy.rules || []) if (!metrics.has(r.metric)) metrics.set(r.metric, { id: r.metric, label: r.metric, unit: r.unit });
+      const legacyWindowID = (id) => /^window:\d+\s+(?:minutes?|hours?|days?)$/i.test(id || "");
+      const ruleForMetric = (m) => policy.rules.find(r => r.metric === m.id || (m.legacyWindowId && legacyWindowID(r.metric)));
+      for (const r of policy.rules || []) if (!metrics.has(r.metric) && ![...metrics.values()].some(m => m.legacyWindowId && legacyWindowID(r.metric))) metrics.set(r.metric, { id: r.metric, label: r.metric, unit: r.unit });
       for (const m of metrics.values()) {
-        const r = policy.rules.find(r => r.metric === m.id);
+        const r = ruleForMetric(m);
         const row = node("div", "quota-rule");
         const label = node("label", "", `${m.label || m.id} · ${m.unit}`);
         const limit = node("input", "words"); limit.inputMode = "decimal"; limit.value = r?.minimum ?? "";
         limit.placeholder = word("Minimum remaining; empty disables this rule"); limit.setAttribute("aria-label", `${m.label || m.id}: ${limit.placeholder}`);
         limit.disabled = !!k.busy;
         limit.oninput = () => {
-          const refreshWithin = policy.rules.find(r => r.metric === m.id)?.refreshWithin || k.nearRanges.get(m.id) || "";
-          policy.rules = policy.rules.filter(r => r.metric !== m.id);
+          const refreshWithin = ruleForMetric(m)?.refreshWithin || k.nearRanges.get(m.id) || "";
+          policy.rules = policy.rules.filter(r => r.metric !== m.id && !(m.legacyWindowId && legacyWindowID(r.metric)));
           if (limit.value.trim() !== "") policy.rules.push({
             metric: m.id, unit: m.unit, minimum: limit.value.trim(),
             ...(refreshWithin ? { refreshWithin } : {}),

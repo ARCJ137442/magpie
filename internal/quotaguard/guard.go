@@ -1,7 +1,8 @@
 // Package quotaguard decides whether a credential may start another upstream
 // attempt. It never estimates a request's cost and never edits a user's switch
 // or an upstream's health/backoff. Observations are the vendor's, not a local
-// spending ledger. A threshold trip latches until an explicit human action.
+// spending ledger. A threshold trip latches until an explicit human action,
+// unless the opt-in auto-rearm policy has confirmed a durable recovery.
 package quotaguard
 
 import (
@@ -9,6 +10,7 @@ import (
 	"fmt"
 	"math/big"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -25,6 +27,11 @@ const (
 	RefreshModeEveryAttempt = "everyAttempt"
 )
 
+const (
+	defaultAutoRearmConsecutive     = 2
+	defaultAutoRearmHeadroomPercent = 10
+)
+
 var ErrConflict = errors.New("quota guard changed; reload before applying this action")
 
 // Rule names a reported metric, not a vendor or a synthetic local budget.
@@ -37,11 +44,43 @@ type Rule struct {
 	RefreshWithin string `json:"refreshWithin,omitempty"`
 }
 
+// AutoRearm clears a latched trip only after repeated fresh readings clear
+// every rule by a configured headroom. It is opt-in; a nil value keeps the
+// original latch semantics.
+type AutoRearm struct {
+	Enabled         bool `json:"enabled"`
+	Consecutive     int  `json:"consecutive,omitempty"`
+	HeadroomPercent int  `json:"headroomPercent,omitempty"`
+	MaxAgeSeconds   int  `json:"maxAgeSeconds,omitempty"`
+}
+
+func (a AutoRearm) consecutive() int {
+	if a.Consecutive == 0 {
+		return defaultAutoRearmConsecutive
+	}
+	return a.Consecutive
+}
+
+func (a AutoRearm) headroomPercent() int {
+	if a.HeadroomPercent == 0 {
+		return defaultAutoRearmHeadroomPercent
+	}
+	return a.HeadroomPercent
+}
+
+func (a AutoRearm) maxAge(policyMaxAge time.Duration) time.Duration {
+	if a.MaxAgeSeconds == 0 {
+		return policyMaxAge
+	}
+	return time.Duration(a.MaxAgeSeconds) * time.Second
+}
+
 type Policy struct {
-	Enabled       bool   `json:"enabled"`
-	Rules         []Rule `json:"rules"`
-	MaxAgeSeconds int    `json:"maxAgeSeconds,omitempty"`
-	RefreshMode   string `json:"refreshMode,omitempty"`
+	Enabled       bool       `json:"enabled"`
+	Rules         []Rule     `json:"rules"`
+	MaxAgeSeconds int        `json:"maxAgeSeconds,omitempty"`
+	RefreshMode   string     `json:"refreshMode,omitempty"`
+	AutoRearm     *AutoRearm `json:"autoRearm,omitempty"`
 	// A custom balance uses the provider's EXISTING Balance URL and auth.
 	// The explicit raw JSON pointer is a numeric field, not BalancePath's
 	// formatted text/expression. No new destination or script is introduced.
@@ -80,6 +119,22 @@ func (p Policy) Validate() error {
 	default:
 		return errors.New("unknown quota refresh mode")
 	}
+	if a := p.AutoRearm; a != nil {
+		if a.Consecutive != 0 && (a.Consecutive < 2 || a.Consecutive > 10) {
+			return errors.New("automatic re-arm needs 2 to 10 consecutive readings")
+		}
+		if a.HeadroomPercent != 0 && (a.HeadroomPercent < 1 || a.HeadroomPercent > 100) {
+			return errors.New("automatic re-arm headroom must be 1 to 100 percent")
+		}
+		if a.MaxAgeSeconds != 0 {
+			if a.MaxAgeSeconds < 5 || a.MaxAgeSeconds > 600 {
+				return errors.New("automatic re-arm reading age must be 5 to 600 seconds")
+			}
+			if p.Enabled && a.Enabled && time.Duration(a.MaxAgeSeconds)*time.Second > p.MaxAge() {
+				return errors.New("automatic re-arm reading age must not exceed the policy reading age")
+			}
+		}
+	}
 	if p.Enabled && len(p.Rules) == 0 {
 		return errors.New("an enabled quota guard needs a rule")
 	}
@@ -110,6 +165,13 @@ func (p Policy) Validate() error {
 			}
 			hasNearBand = true
 		}
+		if p.Enabled && p.AutoRearm != nil && p.AutoRearm.Enabled && r.Unit == "percent" {
+			headroom := new(big.Rat).Mul(n, big.NewRat(int64(p.AutoRearm.headroomPercent()), 100))
+			threshold := new(big.Rat).Add(new(big.Rat).Set(n), headroom)
+			if threshold.Cmp(big.NewRat(100, 1)) >= 0 {
+				return errors.New("automatic re-arm headroom leaves no recoverable percentage above the reserve")
+			}
+		}
 	}
 	if p.Enabled && p.RefreshMode == RefreshModeNearReserve && !hasNearBand {
 		return errors.New("near-reserve refresh needs a positive range on at least one rule")
@@ -127,12 +189,13 @@ func (p Policy) Validate() error {
 // Scope is provenance, not an assertion that a key owns an independent pool.
 // Several credentials may observe one account balance. No totals are added.
 type Metric struct {
-	ID        string     `json:"id"`
-	Label     string     `json:"label"`
-	Unit      string     `json:"unit"`
-	Remaining string     `json:"remaining"`
-	Scope     string     `json:"scope"`
-	ResetAt   *time.Time `json:"resetAt,omitempty"`
+	ID             string     `json:"id"`
+	Label          string     `json:"label"`
+	Unit           string     `json:"unit"`
+	Remaining      string     `json:"remaining"`
+	Scope          string     `json:"scope"`
+	ResetAt        *time.Time `json:"resetAt,omitempty"`
+	LegacyWindowID bool       `json:"legacyWindowId,omitempty"`
 }
 
 type Snapshot struct {
@@ -152,12 +215,23 @@ type Reason struct {
 }
 
 type Protection struct {
-	Tripped       bool       `json:"tripped"`
-	TrippedAt     *time.Time `json:"trippedAt,omitempty"`
-	Reasons       []Reason   `json:"reasons,omitempty"`
-	OverrideUntil *time.Time `json:"overrideUntil,omitempty"`
-	LastAction    string     `json:"lastAction,omitempty"`
-	ActionAt      *time.Time `json:"actionAt,omitempty"`
+	Tripped       bool             `json:"tripped"`
+	TrippedAt     *time.Time       `json:"trippedAt,omitempty"`
+	Reasons       []Reason         `json:"reasons,omitempty"`
+	OverrideUntil *time.Time       `json:"overrideUntil,omitempty"`
+	LastAction    string           `json:"lastAction,omitempty"`
+	ActionAt      *time.Time       `json:"actionAt,omitempty"`
+	RecoveryCount int              `json:"recoveryCount,omitempty"`
+	LastAutoRearm *AutoRearmRecord `json:"lastAutoRearm,omitempty"`
+}
+
+type AutoRearmRecord struct {
+	At              time.Time `json:"at"`
+	Source          string    `json:"source"`
+	ObservedAt      time.Time `json:"observedAt"`
+	Consecutive     int       `json:"consecutive"`
+	HeadroomPercent int       `json:"headroomPercent"`
+	MaxAgeSeconds   int       `json:"maxAgeSeconds"`
 }
 
 type Entry struct {
@@ -196,44 +270,14 @@ func Assess(e Entry, manualEnabled bool, now time.Time) Decision {
 	d.OverrideUntil = e.Protection.OverrideUntil
 	d.OverrideActive = d.OverrideUntil != nil && now.Before(*d.OverrideUntil)
 	for _, rule := range e.Policy.Rules {
-		var metric *Metric
-		var at time.Time
-		ambiguous := false
-		for _, snap := range e.Snapshots {
-			for _, m := range snap.Metrics {
-				if m.ID != rule.Metric {
-					continue
-				}
-				if metric != nil {
-					ambiguous = true
-					continue
-				}
-				copy := m
-				metric = &copy
-				at = snap.ObservedAt
-			}
-		}
-		why := ""
-		switch {
-		case ambiguous:
-			why = "ambiguous_metric"
-		case metric == nil:
-			why = "missing_metric"
-		case at.IsZero() || at.After(now) || now.Sub(at) > e.Policy.MaxAge():
-			why = "stale_metric"
-		case metric.Unit != rule.Unit:
-			why = "unit_mismatch"
-		case metric.ResetAt != nil && !now.Before(*metric.ResetAt):
-			why = "window_needs_refresh"
-		}
+		value, metric, why := readRule(e, rule, now, e.Policy.MaxAge())
 		if why != "" {
 			d.Unknown = true
 			d.Reasons = append(d.Reasons, Reason{Metric: rule.Metric, Code: why})
 			continue
 		}
-		value, err := Number(metric.Remaining)
 		minimum, merr := Number(rule.Minimum)
-		if err != nil || merr != nil {
+		if merr != nil {
 			d.Unknown = true
 			d.Reasons = append(d.Reasons, Reason{Metric: rule.Metric, Code: "invalid_amount"})
 			continue
@@ -256,6 +300,170 @@ func Assess(e Entry, manualEnabled bool, now time.Time) Decision {
 	return d
 }
 
+// readRule resolves one accepted metric value and its freshness checks. It is
+// shared by normal admission and the stricter automatic re-arm evaluation.
+func readRule(e Entry, rule Rule, now time.Time, maxAge time.Duration) (*big.Rat, Metric, string) {
+	var metric *Metric
+	var at time.Time
+	ambiguous := false
+	matchRule := func(m Metric) bool { return m.ID == rule.Metric }
+	for _, snap := range e.Snapshots {
+		for _, m := range snap.Metrics {
+			if !matchRule(m) {
+				continue
+			}
+			if metric != nil {
+				ambiguous = true
+				continue
+			}
+			copy := m
+			metric = &copy
+			at = snap.ObservedAt
+		}
+	}
+	// Older policies named this MiniMax allowance by its displayed
+	// duration (for example, "window:5 hours"). If that name changes,
+	// keep the rule attached to the stable metric identity. Exact IDs
+	// always take precedence, and multiple fallback matches stay unknown.
+	if metric == nil && !ambiguous && legacyWindowID(rule.Metric) {
+		matchRule = func(m Metric) bool { return m.LegacyWindowID }
+		for _, snap := range e.Snapshots {
+			for _, m := range snap.Metrics {
+				if !matchRule(m) {
+					continue
+				}
+				if metric != nil {
+					ambiguous = true
+					continue
+				}
+				copy := m
+				metric = &copy
+				at = snap.ObservedAt
+			}
+		}
+	}
+	switch {
+	case ambiguous:
+		return nil, Metric{}, "ambiguous_metric"
+	case metric == nil:
+		return nil, Metric{}, "missing_metric"
+	case at.IsZero() || at.After(now) || now.Sub(at) > maxAge:
+		return nil, *metric, "stale_metric"
+	case metric.Unit != rule.Unit:
+		return nil, *metric, "unit_mismatch"
+	case metric.ResetAt != nil && !now.Before(*metric.ResetAt):
+		return nil, *metric, "window_needs_refresh"
+	}
+	value, err := Number(metric.Remaining)
+	if err != nil {
+		return nil, *metric, "invalid_amount"
+	}
+	return value, *metric, ""
+}
+
+// autoRearmReady uses the same metric resolution and failure checks as
+// admission, but with a stricter age limit and a recovery headroom.
+func autoRearmReady(e Entry, now time.Time) bool {
+	a := e.Policy.AutoRearm
+	if a == nil || !a.Enabled {
+		return false
+	}
+	maxAge := a.maxAge(e.Policy.MaxAge())
+	headroom := big.NewRat(int64(a.headroomPercent()), 100)
+	for _, rule := range e.Policy.Rules {
+		value, _, why := readRule(e, rule, now, maxAge)
+		if why != "" || value == nil {
+			return false
+		}
+		minimum, err := Number(rule.Minimum)
+		if err != nil {
+			return false
+		}
+		threshold := new(big.Rat).Add(minimum, new(big.Rat).Mul(minimum, headroom))
+		if value.Cmp(threshold) <= 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// A confirmation must be in the observation that caused it. A refresh of an
+// unrelated balance/window source cannot count the same older snapshot twice.
+func snapshotCoversRules(snap Snapshot, rules []Rule) bool {
+	for _, rule := range rules {
+		found := false
+		for _, m := range snap.Metrics {
+			if m.ID == rule.Metric || legacyWindowID(rule.Metric) && m.LegacyWindowID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+// noteAutoRearm counts accepted observations, not retries of the same
+// snapshot. A failed, stale or below-headroom observation resets the count.
+func noteAutoRearm(e *Entry, snap Snapshot, now time.Time) {
+	a := e.Policy.AutoRearm
+	if a == nil || !a.Enabled || !e.Protection.Tripped {
+		return
+	}
+	if e.Protection.TrippedAt == nil || !snap.StartedAt.After(*e.Protection.TrippedAt) {
+		e.Protection.RecoveryCount = 0
+		return
+	}
+	if !snapshotCoversRules(snap, e.Policy.Rules) || !autoRearmReady(*e, now) {
+		e.Protection.RecoveryCount = 0
+		return
+	}
+	count := e.Protection.RecoveryCount + 1
+	if count < a.consecutive() {
+		e.Protection.RecoveryCount = count
+		return
+	}
+	at := now
+	maxAge := a.maxAge(e.Policy.MaxAge())
+	e.Protection.Tripped = false
+	e.Protection.TrippedAt = nil
+	e.Protection.Reasons = nil
+	e.Protection.RecoveryCount = 0
+	e.Protection.LastAction = "auto-rearm"
+	e.Protection.ActionAt = &at
+	e.Protection.LastAutoRearm = &AutoRearmRecord{
+		At:              at,
+		Source:          snap.Source,
+		ObservedAt:      snap.ObservedAt,
+		Consecutive:     count,
+		HeadroomPercent: a.headroomPercent(),
+		MaxAgeSeconds:   int(maxAge / time.Second),
+	}
+}
+
+func legacyWindowID(id string) bool {
+	name, ok := strings.CutPrefix(id, "window:")
+	if !ok {
+		return false
+	}
+	parts := strings.Fields(name)
+	if len(parts) != 2 {
+		return false
+	}
+	n, err := strconv.Atoi(parts[0])
+	if err != nil || n < 1 {
+		return false
+	}
+	switch strings.ToLower(parts[1]) {
+	case "minute", "minutes", "hour", "hours", "day", "days":
+		return true
+	default:
+		return false
+	}
+}
+
 // Latch records a known crossing, even if another configured metric is unknown.
 // An unknown reading alone is a temporary denial, never a permanent trip.
 func Latch(e *Entry, now time.Time) {
@@ -266,6 +474,7 @@ func Latch(e *Entry, now time.Time) {
 			at := now
 			e.Protection.TrippedAt = &at
 			e.Protection.Reasons = append([]Reason(nil), d.Reasons...)
+			e.Protection.RecoveryCount = 0
 			return
 		}
 	}
@@ -278,7 +487,7 @@ func (d Decision) Message() string {
 	if d.Unknown {
 		return "upstream_quota_unknown: a protected metric is missing, stale or invalid; refresh its quota before retrying"
 	}
-	return "upstream_quota_protected: reserve reached; a person must change the reserve, re-arm after recovery, or grant a time-limited override"
+	return "upstream_quota_protected: reserve reached; a person must change the reserve, re-arm after recovery, or grant a time-limited override (unless automatic re-arm is enabled)"
 }
 
 func ValidateSnapshot(s Snapshot, now time.Time) error {

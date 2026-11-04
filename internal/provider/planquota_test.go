@@ -170,10 +170,10 @@ func TestReadMiniMaxPlan(t *testing.T) {
 	if err != nil || len(ws) != 3 {
 		t.Fatalf("%v %+v", err, ws)
 	}
-	if w := ws[0]; w.Name != "5 hours" || math.Abs(w.Used-28) > 1e-9 || w.Span != 5*time.Hour || w.Aside || w.ResetsAt == nil || w.ResetsAt.UnixMilli() != 1790800000000+5*h {
+	if w := ws[0]; w.Name != "5 hours" || w.GuardMetricID != "minimax-general-interval" || math.Abs(w.Used-28) > 1e-9 || w.Span != 5*time.Hour || w.Aside || w.ResetsAt == nil || w.ResetsAt.UnixMilli() != 1790800000000+5*h {
 		t.Errorf("interval: %+v", w)
 	}
-	if w := ws[1]; w.Name != "7 days" || math.Abs(w.Used-10) > 1e-9 || w.Span != 7*24*time.Hour || w.Aside {
+	if w := ws[1]; w.Name != "7 days" || w.GuardMetricID != "" || math.Abs(w.Used-10) > 1e-9 || w.Span != 7*24*time.Hour || w.Aside {
 		t.Errorf("week: %+v", w)
 	}
 	if w := ws[2]; w.Name != "Video · 24 hours" || w.Used != 100 || !w.Aside {

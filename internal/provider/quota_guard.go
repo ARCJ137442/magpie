@@ -305,7 +305,13 @@ func guardWindowMetrics(ws []QuotaWindow) []quotaguard.Metric {
 			continue
 		}
 		left := math.Max(0, 100-w.Used)
-		out = append(out, quotaguard.Metric{ID: "window:" + WindowCapID(w.Name), Label: w.Name, Unit: "percent", Remaining: strconv.FormatFloat(left, 'f', -1, 64), Scope: "plan", ResetAt: w.ResetsAt})
+		id := "window:" + WindowCapID(w.Name)
+		legacyWindowID := false
+		if w.GuardMetricID != "" {
+			id = "window:" + WindowCapID(w.GuardMetricID)
+			legacyWindowID = true
+		}
+		out = append(out, quotaguard.Metric{ID: id, Label: w.Name, Unit: "percent", Remaining: strconv.FormatFloat(left, 'f', -1, 64), Scope: "plan", ResetAt: w.ResetsAt, LegacyWindowID: legacyWindowID})
 	}
 	return out
 }

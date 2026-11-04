@@ -337,6 +337,11 @@ func readMiniMaxPlan(b []byte) (string, []QuotaWindow, error) {
 			if !general {
 				w.Name = strings.ToUpper(name[:1]) + name[1:] + " · " + w.Name
 				w.Aside = true
+			} else if !x.week {
+				// The interval's duration can change without changing the
+				// allowance it describes. Quota protection must not key this
+				// metric by the provider's current display window name.
+				w.GuardMetricID = "minimax-general-interval"
 			}
 			out = append(out, w)
 		}

@@ -42,6 +42,13 @@ func TestGuardWindowUsesActualNames(t *testing.T) {
 	}
 }
 
+func TestGuardMiniMaxIntervalUsesStableID(t *testing.T) {
+	ms := guardWindowMetrics([]QuotaWindow{{Name: "4 hours", Used: 12, GuardMetricID: "minimax-general-interval"}})
+	if len(ms) != 1 || ms[0].ID != "window:minimax-general-interval" || ms[0].Label != "4 hours" || !ms[0].LegacyWindowID || ms[0].Remaining != "88" {
+		t.Fatalf("%+v", ms)
+	}
+}
+
 func TestGuardOldProviderCannotRefreshChangedSource(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	serveBalance := func(left string) *httptest.Server {
